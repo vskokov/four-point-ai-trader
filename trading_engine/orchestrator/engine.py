@@ -23,6 +23,9 @@ from apscheduler.executors.pool import ThreadPoolExecutor as APThreadPoolExecuto
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import text
 
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
+
 import trading_engine.config.settings as settings
 from trading_engine.data.alphavantage_client import AlphaVantageNewsClient
 from trading_engine.data.alpaca_client import AlpacaMarketData
@@ -472,12 +475,13 @@ class TradingEngine:
 
     def market_open_job(self) -> None:
         """
-        Compute daily portfolio target weights at 09:31 ET (Mon–Fri).
+        Compute daily portfolio target weights and execute rebalance at 09:31 ET (Mon–Fri).
 
-        Collects the most recent MWU decision for each ticker, passes the
-        scores to the portfolio optimizer, and logs the resulting allocation.
-        Falls back to min-variance if Black-Litterman fails.
+        1. Collect the most recent MWU decision for each ticker.
+        2. Run Black-Litterman optimisation; fall back to min-variance on failure.
+        3. If optimisation succeeded, call _execute_rebalance_orders().
         """
+        optimized = False
         try:
             mwu_scores: dict[str, dict[str, Any]] = {}
             for ticker in self._tickers:
@@ -501,12 +505,139 @@ class TradingEngine:
                 weights=result["weights"],
                 n_views=result["n_views"],
             )
+            optimized = True
         except Exception as exc:
             logger.error("engine.portfolio_optimization_failed", error=str(exc))
             try:
                 self.portfolio_optimizer.compute_min_variance()
+                optimized = True
             except Exception as exc2:
                 logger.error("engine.min_variance_fallback_failed", error=str(exc2))
+
+        if not optimized:
+            logger.warning("engine.rebalance.skipped_no_weights")
+            return
+
+        self._execute_rebalance_orders()
+
+    def _execute_rebalance_orders(self) -> None:
+        """
+        Fetch current positions, compute rebalance orders, and execute them.
+
+        Execution order
+        ---------------
+        Sells are processed before buys so that capital freed by reducing
+        positions is available for the subsequent purchases.
+
+        Safety
+        ------
+        - Circuit-breaker is checked before any order is submitted.
+        - Each order is wrapped in its own try/except; a failure on one ticker
+          never prevents the remaining tickers from executing.
+        - Sell quantities are capped at the currently held share count.
+        """
+        # Fetch account state and run circuit-breaker gate
+        try:
+            account_info = self._alpaca.get_account_info()
+            equity = float(account_info["equity"])
+        except Exception as exc:
+            logger.error("engine.rebalance.account_fetch_failed", error=str(exc))
+            return
+
+        if self._risk.circuit_breaker(account_info):
+            logger.warning(
+                "engine.rebalance.halted_circuit_breaker",
+                equity=equity,
+            )
+            return
+
+        # Fetch current open positions
+        try:
+            positions = self._executor.get_positions()
+        except Exception as exc:
+            logger.error("engine.rebalance.positions_fetch_failed", error=str(exc))
+            return
+
+        orders = self.portfolio_optimizer.get_rebalance_orders(positions, equity)
+
+        sells = [o for o in orders if o["action"] == "sell"]
+        buys  = [o for o in orders if o["action"] == "buy"]
+        n_executed = n_skipped = n_errors = 0
+
+        for order in sells + buys:   # sells first — free up capital before buying
+            ticker = order["ticker"]
+            dollar_amount = float(order["dollar_amount"])
+            action = order["action"]
+
+            try:
+                quote = self._alpaca.get_latest_quote(ticker)
+                price = float(quote["mid"])
+                if price <= 0:
+                    logger.warning("engine.rebalance.zero_price", ticker=ticker)
+                    n_skipped += 1
+                    continue
+
+                n_shares = int(dollar_amount / price)
+                if n_shares <= 0:
+                    logger.debug(
+                        "engine.rebalance.order_too_small",
+                        ticker=ticker,
+                        dollar_amount=dollar_amount,
+                    )
+                    n_skipped += 1
+                    continue
+
+                if action == "sell":
+                    # Cap at currently held quantity to avoid over-selling
+                    held = 0
+                    if not positions.empty and "ticker" in positions.columns:
+                        pos_row = positions[positions["ticker"] == ticker]
+                        if not pos_row.empty:
+                            held = int(float(pos_row.iloc[0]["qty"]))
+                    if held <= 0:
+                        logger.debug("engine.rebalance.sell_no_position", ticker=ticker)
+                        n_skipped += 1
+                        continue
+                    n_shares = min(n_shares, held)
+                    side = OrderSide.SELL
+                else:
+                    side = OrderSide.BUY
+
+                order_req = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=n_shares,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
+                submitted = self._executor._trading.submit_order(order_req)
+                n_executed += 1
+                logger.info(
+                    "engine.rebalance.order_submitted",
+                    ticker=ticker,
+                    action=action,
+                    qty=n_shares,
+                    dollar_amount=round(dollar_amount, 2),
+                    target_weight=order["target_weight"],
+                    order_id=str(submitted.id),
+                )
+
+            except Exception as exc:
+                n_errors += 1
+                logger.error(
+                    "engine.rebalance.order_failed",
+                    ticker=ticker,
+                    action=action,
+                    error=str(exc),
+                )
+
+        logger.info(
+            "engine.rebalance.summary",
+            n_executed=n_executed,
+            n_skipped=n_skipped,
+            n_errors=n_errors,
+            n_sells=len(sells),
+            n_buys=len(buys),
+        )
 
     def eod_job(self) -> None:
         """

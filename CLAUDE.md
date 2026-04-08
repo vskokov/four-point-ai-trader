@@ -447,3 +447,24 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     overrides Kelly: `size_usd = equity * target_w * confidence`, capped at
     `max_position_pct`.  Tests that bypass `__init__` via `__new__` must
     explicitly set `executor.portfolio_optimizer = None`.
+
+45. **Rebalance execution order: sells before buys** — `_execute_rebalance_orders`
+    separates the order list from `get_rebalance_orders` into sells and buys, then
+    processes `sells + buys` in that sequence.  This ensures capital freed by
+    reducing positions is available before new purchases are submitted.
+    Sell quantities are capped at currently-held shares (fetched once before the
+    loop) to avoid "no position" rejections from Alpaca.
+
+46. **Circuit-breaker gate on every rebalance** — `_execute_rebalance_orders`
+    calls `self._risk.circuit_breaker(account_info)` before any order is
+    submitted.  A tripped breaker logs a warning and returns immediately; no
+    orders are placed.  The check uses the same `account_info` dict that was
+    just fetched from Alpaca, so it reflects the current equity.
+
+47. **Per-ticker error isolation in rebalance** — every order submission is
+    wrapped in its own `try/except`.  A broker rejection or network error on
+    one ticker logs an `engine.rebalance.order_failed` event and increments
+    `n_errors`, but the loop continues to the next ticker.  A summary log
+    (`engine.rebalance.summary`) is emitted at the end with `n_executed`,
+    `n_skipped`, and `n_errors` counts.  Tests that verify isolation must check
+    that `submit_order` was called N times even when one call raises.

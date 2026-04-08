@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import pandas as pd
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -666,3 +667,158 @@ class TestMainArgParsing:
         import argparse
         with pytest.raises(argparse.ArgumentTypeError):
             _parse_pair("AAPL")
+
+
+# ===========================================================================
+# market_open_job — rebalance execution
+# ===========================================================================
+
+def _make_rebalance_order(ticker: str, action: str, dollar_amount: float = 5_000.0) -> dict:
+    """Build a minimal rebalance order dict matching get_rebalance_orders output."""
+    target = 0.10 if action == "buy" else 0.05
+    current = 0.05 if action == "buy" else 0.10
+    return {
+        "ticker":         ticker,
+        "action":         action,
+        "target_weight":  target,
+        "current_weight": current,
+        "delta_weight":   target - current,
+        "dollar_amount":  dollar_amount,
+    }
+
+
+def _positions_df(*holdings: tuple[str, float, float]) -> pd.DataFrame:
+    """Build a positions DataFrame matching OrderExecutor.get_positions() columns."""
+    rows = [
+        {
+            "ticker":            t,
+            "qty":               float(qty),
+            "market_value":      float(mv),
+            "unrealized_pnl":    0.0,
+            "unrealized_pnl_pct": 0.0,
+        }
+        for t, qty, mv in holdings
+    ]
+    cols = ["ticker", "qty", "market_value", "unrealized_pnl", "unrealized_pnl_pct"]
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def _setup_rebalance_engine(
+    tmp_path,
+    rebalance_orders: list[dict] | None = None,
+    positions: pd.DataFrame | None = None,
+    equity: float = 100_000.0,
+):
+    """
+    Build a TradingEngine with all rebalance-path mocks pre-configured.
+
+    Returns (engine, mock_alpaca).
+    """
+    engine, _, mock_alpaca, _ = _build_engine(tmp_path=tmp_path)
+
+    # BL optimisation succeeds
+    engine.portfolio_optimizer.compute_black_litterman.return_value = {
+        "weights":   {"AAPL": 0.10},
+        "method":    "black_litterman",
+        "n_views":   1,
+        "timestamp": datetime.now(tz=timezone.utc),
+    }
+
+    # Account info
+    mock_alpaca.get_account_info.return_value = _account(equity)
+
+    # Positions
+    if positions is None:
+        positions = _positions_df(("AAPL", 50.0, 7_500.0))
+    engine._executor.get_positions.return_value = positions
+
+    # Rebalance orders
+    engine.portfolio_optimizer.get_rebalance_orders.return_value = (
+        rebalance_orders if rebalance_orders is not None else []
+    )
+
+    # Quote (any ticker → $150)
+    mock_alpaca.get_latest_quote.return_value = {
+        "mid": 150.0, "bid": 149.9, "ask": 150.1,
+    }
+
+    # submit_order returns a simple namespace with an id
+    from types import SimpleNamespace
+    engine._executor._trading.submit_order.return_value = SimpleNamespace(id="test-order-id")
+
+    return engine, mock_alpaca
+
+
+class TestMarketOpenJobRebalance:
+
+    def test_get_rebalance_orders_called_with_correct_equity(self, tmp_path):
+        """After BL succeeds, get_rebalance_orders is called with account equity."""
+        engine, _ = _setup_rebalance_engine(tmp_path, equity=100_000.0)
+
+        engine.market_open_job()
+
+        engine.portfolio_optimizer.get_rebalance_orders.assert_called_once()
+        _, positional, _ = (
+            engine.portfolio_optimizer.get_rebalance_orders.call_args[0],
+            engine.portfolio_optimizer.get_rebalance_orders.call_args[0],
+            engine.portfolio_optimizer.get_rebalance_orders.call_args[1],
+        )
+        equity_arg = positional[1]
+        assert equity_arg == pytest.approx(100_000.0)
+
+    def test_sells_execute_before_buys(self, tmp_path):
+        """Sell orders must be submitted before buy orders regardless of list order."""
+        orders = [
+            _make_rebalance_order("AAPL", "buy",  dollar_amount=5_000.0),
+            _make_rebalance_order("JPM",  "sell", dollar_amount=3_000.0),
+        ]
+        positions = _positions_df(("AAPL", 50.0, 7_500.0), ("JPM", 100.0, 10_000.0))
+        engine, _ = _setup_rebalance_engine(tmp_path, rebalance_orders=orders, positions=positions)
+
+        submitted_symbols: list[str] = []
+
+        from types import SimpleNamespace
+        def capture(req):
+            submitted_symbols.append(req.symbol)
+            return SimpleNamespace(id="ok")
+
+        engine._executor._trading.submit_order.side_effect = capture
+
+        engine.market_open_job()
+
+        assert len(submitted_symbols) == 2
+        assert submitted_symbols[0] == "JPM",  "sell must come first"
+        assert submitted_symbols[1] == "AAPL", "buy must come second"
+
+    def test_circuit_breaker_halts_all_rebalance_orders(self, tmp_path):
+        """A tripped circuit breaker must prevent any order from being submitted."""
+        orders = [_make_rebalance_order("AAPL", "buy")]
+        engine, _ = _setup_rebalance_engine(tmp_path, rebalance_orders=orders)
+        engine._risk.circuit_breaker.return_value = True
+
+        engine.market_open_job()
+
+        engine._executor._trading.submit_order.assert_not_called()
+
+    def test_per_ticker_error_isolation(self, tmp_path):
+        """A failure on one ticker must not prevent the remaining orders from executing."""
+        orders = [
+            _make_rebalance_order("AAPL", "buy"),
+            _make_rebalance_order("MSFT", "buy"),
+            _make_rebalance_order("JPM",  "buy"),
+        ]
+        engine, _ = _setup_rebalance_engine(tmp_path, rebalance_orders=orders)
+
+        from types import SimpleNamespace
+
+        def fail_on_msft(req):
+            if req.symbol == "MSFT":
+                raise RuntimeError("order rejected by broker")
+            return SimpleNamespace(id="ok")
+
+        engine._executor._trading.submit_order.side_effect = fail_on_msft
+
+        engine.market_open_job()   # must not raise
+
+        # All 3 attempted; MSFT threw but AAPL and JPM succeeded
+        assert engine._executor._trading.submit_order.call_count == 3
