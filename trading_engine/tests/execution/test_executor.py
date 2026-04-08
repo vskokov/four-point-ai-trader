@@ -79,6 +79,7 @@ def _make_executor(mock_trading, mock_alpaca):
     executor._alpaca = mock_alpaca
     executor._risk = risk
     executor._trading = mock_trading
+    executor.portfolio_optimizer = None   # no optimizer by default in unit tests
     return executor
 
 

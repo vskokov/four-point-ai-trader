@@ -236,6 +236,7 @@ class OrderExecutor:
         alpaca_client: Any,   # AlpacaMarketData — Any avoids circular import
         risk_manager: RiskManager,
         paper: bool = True,
+        portfolio_optimizer: Any = None,  # PortfolioOptimizer — Any avoids circular import
     ) -> None:
         self._alpaca = alpaca_client
         self._risk = risk_manager
@@ -244,6 +245,7 @@ class OrderExecutor:
             secret_key=settings.ALPACA_SECRET_KEY,
             paper=paper,
         )
+        self.portfolio_optimizer = portfolio_optimizer
         logger.info("executor.init", paper=paper)
 
     # ------------------------------------------------------------------
@@ -372,14 +374,27 @@ class OrderExecutor:
         quote = self._alpaca.get_latest_quote(ticker)
         current_price: float = quote["mid"]
 
-        # Fractional Kelly sizing
-        kelly_f = self._risk.kelly_size(
-            win_rate=float(signal_stats["win_rate"]),
-            avg_win=float(signal_stats["avg_win"]),
-            avg_loss=float(signal_stats["avg_loss"]),
-        )
-        size_usd = float(account_info["equity"]) * kelly_f * confidence
-        n_shares = math.floor(size_usd / current_price) if current_price > 0 else 0
+        # Portfolio-optimizer sizing (overrides Kelly when a target weight exists)
+        _use_kelly = True
+        if self.portfolio_optimizer is not None:
+            target_w = self.portfolio_optimizer.get_target_weight(ticker)
+            if target_w > 0.0:
+                _use_kelly = False
+                equity = float(account_info["equity"])
+                size_usd = equity * target_w * confidence
+                max_usd = equity * self._risk.max_position_pct
+                size_usd = min(size_usd, max_usd)
+                n_shares = int(size_usd / current_price) if current_price > 0 else 0
+
+        if _use_kelly:
+            # Fractional Kelly sizing
+            kelly_f = self._risk.kelly_size(
+                win_rate=float(signal_stats["win_rate"]),
+                avg_win=float(signal_stats["avg_win"]),
+                avg_loss=float(signal_stats["avg_loss"]),
+            )
+            size_usd = float(account_info["equity"]) * kelly_f * confidence
+            n_shares = math.floor(size_usd / current_price) if current_price > 0 else 0
 
         if n_shares == 0:
             logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)

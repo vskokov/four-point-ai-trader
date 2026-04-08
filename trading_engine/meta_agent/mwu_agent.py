@@ -223,7 +223,7 @@ class MWUMetaAgent:
             final_signal=final_signal,
         )
 
-        return {
+        result = {
             "ticker": ticker,
             "final_signal": final_signal,
             "score": score,
@@ -231,6 +231,8 @@ class MWUMetaAgent:
             "weights": weights_dict,
             "timestamp": timestamp,
         }
+        self.last_decision = result
+        return result
 
     def update_weights(
         self,

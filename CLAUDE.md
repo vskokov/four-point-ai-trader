@@ -18,6 +18,7 @@ All runnable code lives under `trading_engine/`.
 | **3 — Backtesting** | BacktestEngine (vectorbt), walk-forward validation, bias checks | **Complete** |
 | **4 — Meta-agent** | MWU ensemble agent conditioned on HMM regime | **Complete** |
 | **5 — Execution** | RiskManager (Kelly + circuit breakers), OrderExecutor, TradingEngine orchestrator, StateManager | **Complete** |
+| **6 — Portfolio** | PortfolioOptimizer (Black-Litterman + Min-Variance, LedoitWolf, daily rebalance job) | **Complete** |
 
 ---
 
@@ -47,7 +48,8 @@ trading_engine/
 ├── orchestrator/
 │   ├── engine.py            # TradingEngine — top-level loop — COMPLETE
 │   └── state_manager.py     # Atomic JSON state + checksum + 3-backup rotation — COMPLETE
-├── portfolio/               # (reserved, unused)
+├── portfolio/
+│   └── portfolio_optimizer.py # PortfolioOptimizer (Black-Litterman + Min-Variance) — COMPLETE
 ├── utils/
 │   └── logging.py           # structlog factory
 ├── main.py                  # CLI entry point — COMPLETE
@@ -64,6 +66,8 @@ trading_engine/
 │   │   └── test_mwu_agent.py        # Unit tests — no DB or network (49 tests)
 │   ├── execution/
 │   │   └── test_executor.py         # Unit tests — fully mocked (41 tests)
+│   ├── portfolio/
+│   │   └── test_portfolio_optimizer.py  # Unit tests — fully mocked (9 tests)
 │   └── test_engine.py               # Unit tests — fully mocked (46 tests)
 ├── conftest.py              # Adds repo root to sys.path for pytest
 ├── requirements.txt
@@ -137,10 +141,11 @@ no separate migration step needed.
 ```bash
 cd trading_engine
 
-# Unit tests only — no DB or network required (240 tests across 7 files)
+# Unit tests only — no DB or network required (336 tests across 9 files)
 .venv/bin/pytest tests/test_alpaca_client.py tests/test_alphavantage_client.py \
     tests/test_hmm_regime.py tests/test_mean_reversion.py tests/test_llm_sentiment.py \
-    tests/backtesting/test_backtest_engine.py tests/meta_agent/test_mwu_agent.py -v
+    tests/backtesting/test_backtest_engine.py tests/meta_agent/test_mwu_agent.py \
+    tests/execution/test_executor.py tests/test_engine.py tests/portfolio/ -v
 
 # Integration tests — require live TimescaleDB
 TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
@@ -403,3 +408,42 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     `next_run_time=datetime.now(tz=utc)` causes the job to fire immediately at
     engine startup (before the first 4-hour interval), ensuring fresh sentiment
     data is available before the first bars arrive.
+
+### Portfolio layer (`portfolio/portfolio_optimizer.py`)
+
+39. **`PortfolioOptimizer._get_return_matrix` instantiates `Storage` internally** —
+    it does a deferred `from trading_engine.data.storage import Storage` and
+    creates a fresh instance each call.  Tests must patch
+    `trading_engine.data.storage.Storage` (not a module-level import) and also
+    patch `trading_engine.portfolio.portfolio_optimizer.settings` to avoid
+    requiring `DB_URL` in the test environment.
+
+40. **`max_weight` must satisfy `max_weight >= 1/n_tickers`** — if the per-ticker
+    ceiling is too tight, the weight-sum-to-1 constraint becomes infeasible.
+    `PortfolioOptimizer` automatically relaxes the bound to `max(max_weight, 1/n)`
+    so optimisation never crashes on a small universe.  The configured
+    `max_weight` is still honoured when the ticker count is large enough
+    (e.g. 10 tickers × 0.10 = 1.0 — exactly feasible).
+
+41. **Black-Litterman view threshold** — only tickers with `abs(score) >= 0.3`
+    AND `confidence >= 0.4` are included as absolute views.  All others are
+    ignored; the prior absorbs them.  When no ticker passes this threshold the
+    optimizer falls back to `compute_min_variance()` automatically.
+
+42. **`MWUMetaAgent.last_decision` is set by `decide()`, not `scheduled_update()`** —
+    `decide()` stores `self.last_decision = result` before returning.
+    `market_open_job` reads `getattr(agent, 'last_decision', None)` to get the
+    most recent ensemble output without triggering a new scoring round.
+
+43. **`market_open_job` runs at 09:31 ET Mon–Fri via APScheduler cron** — it
+    collects `last_decision` from every per-ticker `MWUMetaAgent`, converts the
+    `weights` dict max value to a confidence proxy, and calls
+    `compute_black_litterman`.  All exceptions are caught; a min-variance
+    fallback is attempted on failure.  The engine now registers 3 APScheduler
+    jobs (sentiment, market_open, eod) — tests asserting job count must expect 3.
+
+44. **`OrderExecutor.portfolio_optimizer` defaults to `None`** — when `None`,
+    Kelly sizing is used unchanged.  When set, a non-zero `get_target_weight`
+    overrides Kelly: `size_usd = equity * target_w * confidence`, capped at
+    `max_position_pct`.  Tests that bypass `__init__` via `__new__` must
+    explicitly set `executor.portfolio_optimizer = None`.

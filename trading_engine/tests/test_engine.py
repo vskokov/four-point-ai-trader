@@ -177,6 +177,7 @@ def _build_engine(
     mock_state.load.return_value = None
 
     # Wire everything onto the engine
+    engine.portfolio_optimizer = MagicMock()
     engine._tickers     = list(tickers)
     engine._pairs       = [tuple(p) for p in pairs]
     engine._paper       = True
@@ -401,7 +402,7 @@ class TestEODJob:
 
 class TestSchedulerSetup:
 
-    def test_two_jobs_registered(self, tmp_path):
+    def test_three_jobs_registered(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
 
         mock_scheduler = MagicMock()
@@ -419,6 +420,15 @@ class TestSchedulerSetup:
                 next_run_time=datetime.now(tz=timezone.utc),
             )
             engine._scheduler.add_job(
+                engine.market_open_job,
+                "cron",
+                day_of_week="mon-fri",
+                hour=9,
+                minute=31,
+                timezone="America/New_York",
+                id="market_open_job",
+            )
+            engine._scheduler.add_job(
                 engine.eod_job,
                 "cron",
                 day_of_week="mon-fri",
@@ -428,7 +438,7 @@ class TestSchedulerSetup:
                 id="eod_job",
             )
 
-        assert mock_scheduler.add_job.call_count == 2
+        assert mock_scheduler.add_job.call_count == 3
 
     def test_sentiment_job_registered_as_interval(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)

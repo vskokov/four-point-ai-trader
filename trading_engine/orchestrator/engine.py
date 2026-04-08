@@ -29,6 +29,7 @@ from trading_engine.data.alpaca_client import AlpacaMarketData
 from trading_engine.data.storage import Storage
 from trading_engine.execution.executor import OrderExecutor, RiskManager
 from trading_engine.meta_agent.mwu_agent import MWUMetaAgent
+from trading_engine.portfolio.portfolio_optimizer import PortfolioOptimizer
 from trading_engine.orchestrator.state_manager import StateManager
 from trading_engine.signals.hmm_regime import HMMRegimeDetector
 from trading_engine.signals.llm_sentiment import LLMSentimentSignal
@@ -114,10 +115,24 @@ class TradingEngine:
         }
 
         # ------------------------------------------------------------------
+        # Portfolio optimizer
+        # ------------------------------------------------------------------
+        self.portfolio_optimizer = PortfolioOptimizer(
+            tickers=tickers,
+            max_weight=0.10,
+            min_weight=0.0,
+        )
+
+        # ------------------------------------------------------------------
         # Execution layer
         # ------------------------------------------------------------------
         self._risk = RiskManager()
-        self._executor = OrderExecutor(self._alpaca, self._risk, paper=paper)
+        self._executor = OrderExecutor(
+            self._alpaca,
+            self._risk,
+            paper=paper,
+            portfolio_optimizer=self.portfolio_optimizer,
+        )
 
         # ------------------------------------------------------------------
         # Engine state
@@ -455,6 +470,44 @@ class TradingEngine:
         except Exception as exc:
             logger.error("engine.sentiment_job.failed", error=str(exc))
 
+    def market_open_job(self) -> None:
+        """
+        Compute daily portfolio target weights at 09:31 ET (Mon–Fri).
+
+        Collects the most recent MWU decision for each ticker, passes the
+        scores to the portfolio optimizer, and logs the resulting allocation.
+        Falls back to min-variance if Black-Litterman fails.
+        """
+        try:
+            mwu_scores: dict[str, dict[str, Any]] = {}
+            for ticker in self._tickers:
+                agent = self._mwu.get(ticker)
+                if agent is None:
+                    continue
+                last = getattr(agent, "last_decision", None)
+                if last:
+                    weights_values = list(last.get("weights", {}).values())
+                    confidence = max(weights_values) if weights_values else 0.33
+                    mwu_scores[ticker] = {
+                        "score": last.get("score", 0.0),
+                        "confidence": confidence,
+                        "final_signal": last.get("final_signal", 0),
+                    }
+
+            result = self.portfolio_optimizer.compute_black_litterman(mwu_scores)
+            logger.info(
+                "engine.portfolio_optimized",
+                method=result["method"],
+                weights=result["weights"],
+                n_views=result["n_views"],
+            )
+        except Exception as exc:
+            logger.error("engine.portfolio_optimization_failed", error=str(exc))
+            try:
+                self.portfolio_optimizer.compute_min_variance()
+            except Exception as exc2:
+                logger.error("engine.min_variance_fallback_failed", error=str(exc2))
+
     def eod_job(self) -> None:
         """
         End-of-day housekeeping (runs at 16:05 ET, Mon–Fri via APScheduler).
@@ -538,6 +591,15 @@ class TradingEngine:
             hours=4,
             id="sentiment_job",
             next_run_time=datetime.now(tz=timezone.utc),  # run once at startup
+        )
+        self._scheduler.add_job(
+            self.market_open_job,
+            "cron",
+            day_of_week="mon-fri",
+            hour=9,
+            minute=31,
+            timezone=_ET,
+            id="market_open_job",
         )
         self._scheduler.add_job(
             self.eod_job,
