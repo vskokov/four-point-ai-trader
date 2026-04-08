@@ -1,0 +1,603 @@
+"""
+TradingEngine — top-level orchestration loop.
+
+Wires together every module built in Phases 1–5 and drives the real-time
+trading lifecycle:
+
+  stream_bars WebSocket  →  bar_handler  →  HMM / OU / LLM / MWU  →  Executor
+  APScheduler            →  sentiment_job (every 4 h, market hours)
+                         →  eod_job       (16:05 ET, mon-fri)
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+from apscheduler.executors.pool import ThreadPoolExecutor as APThreadPoolExecutor
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import text
+
+import trading_engine.config.settings as settings
+from trading_engine.data.alphavantage_client import AlphaVantageNewsClient
+from trading_engine.data.alpaca_client import AlpacaMarketData
+from trading_engine.data.storage import Storage
+from trading_engine.execution.executor import OrderExecutor, RiskManager
+from trading_engine.meta_agent.mwu_agent import MWUMetaAgent
+from trading_engine.orchestrator.state_manager import StateManager
+from trading_engine.signals.hmm_regime import HMMRegimeDetector
+from trading_engine.signals.llm_sentiment import LLMSentimentSignal
+from trading_engine.signals.mean_reversion import OUSpreadSignal
+from trading_engine.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+# Regime label → direction signal (+1 bull, 0 neutral, -1 bear)
+_REGIME_TO_SIGNAL: dict[str, int] = {"bull": 1, "neutral": 0, "bear": -1}
+
+# Conservative signal-stats defaults used until real P&L history accumulates
+_DEFAULT_SIGNAL_STATS: dict[str, float] = {
+    "win_rate": 0.52,
+    "avg_win":  0.015,
+    "avg_loss": 0.010,
+}
+
+
+class TradingEngine:
+    """
+    Autonomous trading engine orchestrator.
+
+    Parameters
+    ----------
+    tickers:
+        Universe of equity symbols, e.g. ``["AAPL", "MSFT", "JPM", "BAC"]``.
+    pairs:
+        Pairs for OU mean-reversion, e.g. ``[("JPM", "BAC")]``.
+    paper:
+        If *True* (default) connects to Alpaca paper-trading.
+    models_dir:
+        Root directory for persisted model artefacts.  Defaults to
+        ``trading_engine/models/``.  Pass ``tmp_path`` in tests.
+    """
+
+    def __init__(
+        self,
+        tickers: list[str],
+        pairs: list[tuple[str, str]],
+        paper: bool = True,
+        models_dir: Path | str | None = None,
+    ) -> None:
+        self._tickers = list(tickers)
+        self._pairs = [tuple(p) for p in pairs]
+        self._paper = paper
+        self._models_dir = (
+            Path(models_dir) if models_dir is not None
+            else Path(__file__).parent.parent / "models"
+        )
+
+        logger.info(
+            "engine.init",
+            tickers=self._tickers,
+            pairs=self._pairs,
+            paper=paper,
+        )
+
+        # ------------------------------------------------------------------
+        # Core infrastructure
+        # ------------------------------------------------------------------
+        self._storage = Storage(settings.DB_URL)
+        self._alpaca = AlpacaMarketData(self._storage)
+        self._av_client = AlphaVantageNewsClient()
+
+        # ------------------------------------------------------------------
+        # Signal modules  (one HMM + one MWU per ticker)
+        # ------------------------------------------------------------------
+        self._hmm: dict[str, HMMRegimeDetector] = {
+            t: HMMRegimeDetector(models_dir=self._models_dir)
+            for t in self._tickers
+        }
+        self._ou_signals: dict[tuple, OUSpreadSignal] = {
+            p: OUSpreadSignal(p[0], p[1], models_dir=self._models_dir)
+            for p in self._pairs
+        }
+        self._llm = LLMSentimentSignal()
+        self._mwu: dict[str, MWUMetaAgent] = {
+            t: MWUMetaAgent(models_dir=self._models_dir)
+            for t in self._tickers
+        }
+
+        # ------------------------------------------------------------------
+        # Execution layer
+        # ------------------------------------------------------------------
+        self._risk = RiskManager()
+        self._executor = OrderExecutor(self._alpaca, self._risk, paper=paper)
+
+        # ------------------------------------------------------------------
+        # Engine state
+        # ------------------------------------------------------------------
+        self._state_manager = StateManager(state_dir=self._models_dir)
+        # Per-ticker Kelly stats, updated by eod_job
+        self._signal_stats: dict[str, dict[str, float]] = {
+            t: dict(_DEFAULT_SIGNAL_STATS) for t in self._tickers
+        }
+        self._shutdown_event = threading.Event()
+        self._emergency_close = False
+        self._scheduler: BackgroundScheduler | None = None
+
+        # Load any persisted metadata
+        self._load_state()
+
+        # Load persisted model artefacts (HMM, Kalman inside OU, MWU weights)
+        self._load_models()
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Restore engine metadata from the last saved snapshot (if any)."""
+        try:
+            state = self._state_manager.load()
+        except ValueError as exc:
+            logger.error("engine.state_load_failed", error=str(exc))
+            state = None
+
+        if state is None:
+            return
+
+        self._signal_stats.update(state.get("signal_stats", {}))
+        logger.info("engine.state_restored", keys=list(state.keys()))
+
+    def _save_state(self) -> None:
+        """Persist current engine metadata."""
+        self._state_manager.save(
+            {
+                "tickers":      self._tickers,
+                "pairs":        [list(p) for p in self._pairs],
+                "paper":        self._paper,
+                "signal_stats": self._signal_stats,
+                "hmm_fitted":   {t: self._hmm[t].is_fitted for t in self._tickers},
+            }
+        )
+
+    def _load_models(self) -> None:
+        """Attempt to load persisted HMM models for each ticker."""
+        for ticker in self._tickers:
+            try:
+                self._hmm[ticker].load(ticker)
+                logger.info("engine.hmm_loaded", ticker=ticker)
+            except FileNotFoundError:
+                logger.warning(
+                    "engine.hmm_not_found",
+                    ticker=ticker,
+                    hint="run startup_checks() to fit",
+                )
+
+    # ------------------------------------------------------------------
+    # Startup checks
+    # ------------------------------------------------------------------
+
+    def startup_checks(self) -> None:
+        """
+        Verify all external services are accessible and models are fitted.
+
+        1. Alpaca paper account reachable.
+        2. Ollama / Gemma running.
+        3. TimescaleDB reachable.
+        4. HMM models — if any unfitted, attempt to fit on last 252 days.
+
+        Raises
+        ------
+        RuntimeError
+            If any critical dependency is unavailable.
+        """
+        logger.info("engine.startup_checks.start")
+
+        # 1. Alpaca
+        try:
+            acct = self._alpaca.get_account_info()
+            logger.info("engine.startup_checks.alpaca_ok", equity=acct["equity"])
+        except Exception as exc:
+            raise RuntimeError(f"Alpaca unreachable: {exc}") from exc
+
+        # 2. Ollama
+        try:
+            import ollama
+            client = ollama.Client(host=settings.OLLAMA_HOST, timeout=10)
+            models = client.list()
+            tags = [m.model for m in models.models]
+            if not any(settings.OLLAMA_MODEL in tag for tag in tags):
+                raise RuntimeError(
+                    f"Ollama model {settings.OLLAMA_MODEL!r} not found. "
+                    f"Available: {tags}"
+                )
+            logger.info("engine.startup_checks.ollama_ok", model=settings.OLLAMA_MODEL)
+        except Exception as exc:
+            raise RuntimeError(f"Ollama unavailable: {exc}") from exc
+
+        # 3. TimescaleDB
+        try:
+            with self._storage._engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info("engine.startup_checks.db_ok")
+        except Exception as exc:
+            raise RuntimeError(f"TimescaleDB unreachable: {exc}") from exc
+
+        # 4. HMM models
+        end = datetime.now(tz=timezone.utc)
+        start = end - timedelta(days=int(252 * 1.4))   # generous fetch window
+
+        for ticker in self._tickers:
+            if not self._hmm[ticker].is_fitted:
+                logger.info("engine.startup_checks.hmm_fit", ticker=ticker)
+                try:
+                    self._hmm[ticker].fit(ticker, start, end, self._storage)
+                    logger.info("engine.startup_checks.hmm_fitted", ticker=ticker)
+                except Exception as exc:
+                    logger.warning(
+                        "engine.startup_checks.hmm_fit_failed",
+                        ticker=ticker,
+                        error=str(exc),
+                    )
+
+        logger.info("engine.startup_checks.done")
+
+    # ------------------------------------------------------------------
+    # Internal signal helpers
+    # ------------------------------------------------------------------
+
+    def _get_latest_llm_signal(self, ticker: str) -> dict[str, Any]:
+        """
+        Query signal_log for the most recent ``llm_sentiment`` entry for *ticker*
+        written within the last 12 hours.  Returns neutral if nothing found.
+        """
+        try:
+            with self._storage._engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT value, metadata
+                        FROM   signal_log
+                        WHERE  ticker      = :ticker
+                          AND  signal_name = 'llm_sentiment'
+                          AND  time       >= NOW() - INTERVAL '12 hours'
+                        ORDER  BY time DESC
+                        LIMIT  1
+                        """
+                    ),
+                    {"ticker": ticker},
+                ).fetchone()
+        except Exception as exc:
+            logger.warning("engine.llm_signal_query_failed", ticker=ticker, error=str(exc))
+            return {"signal": 0, "confidence": 0.0}
+
+        if row is None:
+            return {"signal": 0, "confidence": 0.0}
+
+        value = float(row[0])
+        meta: dict[str, Any] = json.loads(row[1]) if row[1] else {}
+        direction = int(meta.get("direction", 0))
+        confidence = float(meta.get("confidence", abs(value)))
+        return {"signal": direction, "confidence": min(confidence, 1.0)}
+
+    def _get_ou_signal_for_ticker(self, ticker: str) -> dict[str, Any]:
+        """
+        Return the OU spread signal for the first pair that contains *ticker*.
+        Returns neutral if no pair exists or not enough data.
+        """
+        for pair, ou in self._ou_signals.items():
+            if ticker not in pair:
+                continue
+            try:
+                end = datetime.now(tz=timezone.utc)
+                start = end - timedelta(days=3)   # ~390 min-bars
+                df1 = self._storage.query_ohlcv(pair[0], start, end)
+                df2 = self._storage.query_ohlcv(pair[1], start, end)
+                min_rows = max(ou.lookback, 10)
+                if len(df1) < min_rows or len(df2) < min_rows:
+                    return {"signal": 0, "confidence": 0.0}
+                result = ou.compute_signal(df1, df2, storage=self._storage)
+                z = result["z_score"]
+                return {
+                    "signal": result["signal"],
+                    "confidence": min(abs(z) / 3.0, 1.0),
+                }
+            except Exception as exc:
+                logger.warning(
+                    "engine.ou_signal_failed",
+                    ticker=ticker,
+                    pair=pair,
+                    error=str(exc),
+                )
+                return {"signal": 0, "confidence": 0.0}
+        return {"signal": 0, "confidence": 0.0}
+
+    # ------------------------------------------------------------------
+    # Bar handler
+    # ------------------------------------------------------------------
+
+    def bar_handler(self, bar: dict[str, Any]) -> None:
+        """
+        Process one new price bar.  Called by the Alpaca WebSocket stream on
+        each 1-minute (or 5-minute) bar.  Runs in the stream's background thread.
+
+        Steps
+        -----
+        1. Insert bar to storage.
+        2. HMM online update; predict regime.
+        3. OU spread signal for any pair containing this ticker.
+        4. Retrieve latest LLM sentiment signal from signal_log.
+        5. MWU scheduled_update() → ensemble decision.
+        6. Submit order if final_signal != 0.
+        7. Check circuit breaker; trigger emergency shutdown if breached.
+        """
+        ticker = bar["ticker"]
+
+        if ticker not in self._tickers:
+            return  # bar for a symbol outside our universe
+
+        # 1. Persist
+        self._storage.insert_ohlcv([bar])
+
+        # 2. HMM regime
+        hmm = self._hmm[ticker]
+        hmm.partial_fit_online(bar)
+
+        hmm_signal: dict[str, Any] = {"signal": 0, "confidence": 0.0}
+        regime = 1   # default neutral
+
+        if hmm.is_fitted:
+            try:
+                regime_result = hmm.predict_regime(ticker, storage=self._storage)
+                regime = regime_result["regime"]
+                label = regime_result["label"]
+                direction = _REGIME_TO_SIGNAL.get(label, 0)
+                confidence = float(max(regime_result["probs"]))
+                hmm_signal = {"signal": direction, "confidence": confidence}
+            except Exception as exc:
+                logger.warning(
+                    "engine.hmm_predict_failed", ticker=ticker, error=str(exc)
+                )
+
+        # 3. OU spread signal
+        ou_signal = self._get_ou_signal_for_ticker(ticker)
+
+        # 4. LLM sentiment
+        llm_signal = self._get_latest_llm_signal(ticker)
+
+        # 5. Assemble signals dict and run MWU
+        signals: dict[str, dict[str, Any]] = {
+            "hmm_regime":    hmm_signal,
+            "ou_spread":     ou_signal,
+            "llm_sentiment": llm_signal,
+        }
+
+        decision = self._mwu[ticker].scheduled_update(
+            ticker=ticker,
+            signals=signals,
+            regime=regime,
+            storage=self._storage,
+        )
+
+        final_signal: int = decision["final_signal"]
+
+        # 6. Order submission
+        if final_signal != 0:
+            try:
+                account_info = self._alpaca.get_account_info()
+                self._executor.submit_order(
+                    ticker=ticker,
+                    signal=final_signal,
+                    confidence=abs(decision["score"]),
+                    account_info=account_info,
+                    signal_stats=self._signal_stats[ticker],
+                )
+            except Exception as exc:
+                logger.error(
+                    "engine.order_failed", ticker=ticker, error=str(exc)
+                )
+
+        # 7. Circuit breaker check (after any order attempt)
+        try:
+            account_info = self._alpaca.get_account_info()
+            if self._risk.circuit_breaker(account_info):
+                logger.critical(
+                    "engine.circuit_breaker_triggered",
+                    ticker=ticker,
+                    equity=account_info["equity"],
+                )
+                self._emergency_close = True
+                self._shutdown_event.set()
+        except Exception as exc:
+            logger.warning("engine.account_check_failed", error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Scheduled jobs
+    # ------------------------------------------------------------------
+
+    def sentiment_job(self) -> None:
+        """
+        Fetch news and run LLM sentiment pipeline.
+
+        Runs every 4 hours via APScheduler.  Includes an internal market-hours
+        guard so it silently skips outside NYSE core session (09:30–16:00 ET,
+        Mon–Fri).
+        """
+        now_et = datetime.now(tz=_ET)
+        is_weekday = now_et.weekday() < 5
+        after_open  = (now_et.hour, now_et.minute) >= (9, 30)
+        before_close = (now_et.hour, now_et.minute) < (16, 0)
+
+        if not (is_weekday and after_open and before_close):
+            logger.debug(
+                "engine.sentiment_job.skipped",
+                reason="outside_market_hours",
+                now_et=now_et.isoformat(),
+            )
+            return
+
+        logger.info("engine.sentiment_job.start")
+        try:
+            results = self._llm.run_pipeline(
+                self._tickers, self._av_client, self._storage
+            )
+            logger.info(
+                "engine.sentiment_job.done",
+                n_tickers=len(results),
+            )
+        except Exception as exc:
+            logger.error("engine.sentiment_job.failed", error=str(exc))
+
+    def eod_job(self) -> None:
+        """
+        End-of-day housekeeping (runs at 16:05 ET, Mon–Fri via APScheduler).
+
+        1. Log daily P&L summary.
+        2. MWU performance report per ticker.
+        3. Update signal stats for Kelly sizing.
+        4. Persist all model state.
+        """
+        logger.info("engine.eod_job.start")
+
+        # Daily P&L
+        try:
+            account_info = self._alpaca.get_account_info()
+            positions = self._executor.get_positions()
+            logger.info(
+                "engine.eod_job.pnl_summary",
+                equity=account_info["equity"],
+                cash=account_info["cash"],
+                open_positions=len(positions),
+            )
+        except Exception as exc:
+            logger.error("engine.eod_job.pnl_failed", error=str(exc))
+
+        # MWU performance + Kelly stat update
+        for ticker in self._tickers:
+            try:
+                report = self._mwu[ticker].performance_report()
+                logger.info(
+                    "engine.eod_job.mwu_report",
+                    ticker=ticker,
+                    n_updates=report.get("n_updates"),
+                    weights=report.get("current_weights"),
+                )
+
+                # Derive ensemble win rate from per-signal rates
+                rates = [
+                    v for v in report.get("per_signal_win_rate", {}).values()
+                    if v is not None
+                ]
+                if rates:
+                    self._signal_stats[ticker]["win_rate"] = sum(rates) / len(rates)
+            except Exception as exc:
+                logger.error(
+                    "engine.eod_job.mwu_report_failed", ticker=ticker, error=str(exc)
+                )
+
+        # Persist state
+        try:
+            self._save_state()
+        except Exception as exc:
+            logger.error("engine.eod_job.state_save_failed", error=str(exc))
+
+        logger.info("engine.eod_job.done")
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """
+        Start the trading engine.
+
+        1. Configure APScheduler with sentiment (every 4 h) and EOD (16:05 ET)
+           jobs.
+        2. Start the Alpaca WebSocket bar stream (background thread).
+        3. Block until ``KeyboardInterrupt`` or the circuit-breaker fires.
+        4. On shutdown: persist state; close all positions if emergency flag set.
+        """
+        logger.info("engine.run.start", tickers=self._tickers)
+
+        # APScheduler
+        self._scheduler = BackgroundScheduler(
+            executors={"default": APThreadPoolExecutor(max_workers=4)},
+            job_defaults={"misfire_grace_time": 300},
+        )
+
+        self._scheduler.add_job(
+            self.sentiment_job,
+            "interval",
+            hours=4,
+            id="sentiment_job",
+            next_run_time=datetime.now(tz=timezone.utc),  # run once at startup
+        )
+        self._scheduler.add_job(
+            self.eod_job,
+            "cron",
+            day_of_week="mon-fri",
+            hour=16,
+            minute=5,
+            timezone=_ET,
+            id="eod_job",
+        )
+
+        self._scheduler.start()
+        logger.info("engine.run.scheduler_started")
+
+        # Live bar stream
+        self._alpaca.stream_bars(self._tickers, self.bar_handler)
+        logger.info("engine.run.stream_started", tickers=self._tickers)
+
+        # Block until shutdown
+        try:
+            self._shutdown_event.wait()
+        except KeyboardInterrupt:
+            logger.info("engine.run.keyboard_interrupt")
+
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Graceful shutdown sequence."""
+        logger.info(
+            "engine.shutdown.start",
+            emergency=self._emergency_close,
+        )
+
+        # Stop the bar stream
+        try:
+            self._alpaca.stop_stream()
+        except Exception as exc:
+            logger.warning("engine.shutdown.stream_stop_failed", error=str(exc))
+
+        # Stop the scheduler
+        if self._scheduler and self._scheduler.running:
+            try:
+                self._scheduler.shutdown(wait=False)
+            except Exception as exc:
+                logger.warning("engine.shutdown.scheduler_stop_failed", error=str(exc))
+
+        # Emergency liquidation
+        if self._emergency_close:
+            logger.critical("engine.shutdown.emergency_liquidation")
+            try:
+                self._executor.close_all_positions()
+            except Exception as exc:
+                logger.critical(
+                    "engine.shutdown.liquidation_failed", error=str(exc)
+                )
+
+        # Final state save
+        try:
+            self._save_state()
+        except Exception as exc:
+            logger.error("engine.shutdown.state_save_failed", error=str(exc))
+
+        logger.info("engine.shutdown.done")
