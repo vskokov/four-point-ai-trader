@@ -45,6 +45,76 @@ logger = get_logger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
+# Default path for discovered pairs written by pair_scanner.py
+_DISCOVERED_PAIRS_PATH = Path(__file__).parent.parent / "config" / "discovered_pairs.json"
+
+
+def _load_discovered_pairs(path: Path | None = None) -> list[tuple[str, str]]:
+    """
+    Load cointegrated pairs from a JSON file written by ``pair_scanner.py``.
+
+    Parameters
+    ----------
+    path:
+        Path to ``discovered_pairs.json``.  Defaults to
+        ``trading_engine/config/discovered_pairs.json``.
+
+    Returns
+    -------
+    list of ``(ticker1, ticker2)`` tuples, or ``[]`` if the file is missing
+    or malformed.
+
+    Warnings
+    --------
+    - If the file does not exist, logs a warning and returns ``[]``.
+    - If ``scanned_at`` is more than 14 days old, logs a staleness warning
+      but still returns the pairs.
+    """
+    if path is None:
+        path = _DISCOVERED_PAIRS_PATH
+
+    if not path.exists():
+        logger.warning("engine.pairs_file_not_found", path=str(path))
+        return []
+
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "engine.pairs_file_malformed", path=str(path), error=str(exc)
+        )
+        return []
+
+    # Staleness check
+    scanned_at = data.get("scanned_at")
+    if scanned_at:
+        try:
+            scanned_dt = datetime.fromisoformat(
+                scanned_at.replace("Z", "+00:00")
+            )
+            age_days = (datetime.now(tz=timezone.utc) - scanned_dt).days
+            if age_days > 14:
+                logger.warning(
+                    "engine.pairs_file_stale",
+                    path=str(path),
+                    age_days=age_days,
+                )
+        except (ValueError, TypeError):
+            pass
+
+    raw_pairs = data.get("pairs", [])
+    result: list[tuple[str, str]] = []
+    for entry in raw_pairs:
+        try:
+            result.append((entry["ticker1"], entry["ticker2"]))
+        except (KeyError, TypeError):
+            continue
+
+    logger.info(
+        "engine.pairs_loaded", path=str(path), n_pairs=len(result)
+    )
+    return result
+
 # Regime label → direction signal (+1 bull, 0 neutral, -1 bear)
 _REGIME_TO_SIGNAL: dict[str, int] = {"bull": 1, "neutral": 0, "bear": -1}
 
@@ -64,24 +134,39 @@ class TradingEngine:
     ----------
     tickers:
         Universe of equity symbols, e.g. ``["AAPL", "MSFT", "JPM", "BAC"]``.
-    pairs:
-        Pairs for OU mean-reversion, e.g. ``[("JPM", "BAC")]``.
+        Pair tickers discovered in *pairs_file* are automatically merged in.
     paper:
         If *True* (default) connects to Alpaca paper-trading.
     models_dir:
         Root directory for persisted model artefacts.  Defaults to
         ``trading_engine/models/``.  Pass ``tmp_path`` in tests.
+    pairs_file:
+        Path to ``discovered_pairs.json`` written by ``pair_scanner.py``.
+        Defaults to ``trading_engine/config/discovered_pairs.json``.
+        Pass ``None`` to use the default location.
     """
 
     def __init__(
         self,
         tickers: list[str],
-        pairs: list[tuple[str, str]],
         paper: bool = True,
         models_dir: Path | str | None = None,
+        pairs_file: Path | str | None = None,
     ) -> None:
         self._tickers = list(tickers)
-        self._pairs = [tuple(p) for p in pairs]
+        self._pairs = _load_discovered_pairs(
+            Path(pairs_file) if pairs_file is not None else None
+        )
+
+        # Auto-merge pair tickers into self._tickers so that both legs of every
+        # pair receive WebSocket subscriptions, HMM detectors, MWU agents, and
+        # portfolio weights.
+        pair_tickers = {t for p in self._pairs for t in p}
+        new_tickers = sorted(pair_tickers - set(self._tickers))
+        if new_tickers:
+            logger.info("engine.pair_tickers_added", tickers=new_tickers)
+            self._tickers.extend(new_tickers)
+
         self._paper = paper
         self._models_dir = (
             Path(models_dir) if models_dir is not None
@@ -92,7 +177,7 @@ class TradingEngine:
             "engine.init",
             tickers=self._tickers,
             pairs=self._pairs,
-            paper=paper,
+            paper=self._paper,
         )
 
         # ------------------------------------------------------------------
@@ -120,10 +205,10 @@ class TradingEngine:
         }
 
         # ------------------------------------------------------------------
-        # Portfolio optimizer
+        # Portfolio optimizer  (uses merged self._tickers)
         # ------------------------------------------------------------------
         self.portfolio_optimizer = PortfolioOptimizer(
-            tickers=tickers,
+            tickers=self._tickers,
             max_weight=0.10,
             min_weight=0.0,
         )

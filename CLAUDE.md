@@ -506,3 +506,34 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     ensures headlines are not re-scored across overlapping windows.  On a fresh
     engine restart, `_seen_hashes` is empty so the first run may re-score recent
     headlines — this is acceptable and self-corrects after one cycle.
+
+### Pair discovery (`tools/pair_scanner.py`, `orchestrator/engine.py`)
+
+53. **`pair_scanner.py` is a standalone CLI tool, not imported by the engine** —
+    it reuses `CointegrationTest` and `OUSpreadSignal.fit_ou_params` from
+    `signals/mean_reversion.py`.  Run it weekly or whenever the universe
+    changes.  Output goes to `config/discovered_pairs.json`.  It can also be
+    called programmatically via `run_scan(tickers=..., _alpaca=mock_alpaca)`
+    which accepts an injectable `AlpacaMarketData` instance for testing.
+
+54. **The engine loads pairs from `discovered_pairs.json` at startup via
+    `_load_discovered_pairs()`** — if the file is missing, `self._pairs` is
+    empty and no OU signals are computed; the engine still runs on HMM + LLM
+    signals only.  If the file is stale (>14 days), a warning is logged but
+    the pairs are still used.  The `pairs_file` constructor parameter and
+    `--pairs-file` CLI flag allow overriding the default path.
+
+55. **Pair tickers are auto-merged into `_tickers` at engine init** — after
+    `_load_discovered_pairs()` returns, the engine computes
+    `pair_tickers = {t for p in self._pairs for t in p}` and appends any
+    tickers not already in `self._tickers`.  This ensures both legs of every
+    pair get WebSocket subscriptions, HMM detectors, MWU agents, and portfolio
+    optimizer weights.  The `TradingEngine` constructor no longer accepts a
+    `pairs` argument.
+
+56. **The correlation pre-filter uses log-returns, not prices** — raw price
+    correlation is spurious for any two trending series (they always appear
+    correlated).  Log-return correlation (`np.log(df / df.shift(1))`) captures
+    co-movement of actual returns and is the correct input to the cointegration
+    screening step.  A pair must clear `min_correlation=0.70` on log-returns
+    before the more expensive EG test is run.

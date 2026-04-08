@@ -97,6 +97,9 @@ def _build_engine(
     hmm_fitted: bool = True,
     mwu_decision: dict | None = None,
 ):
+    # Note: _build_engine bypasses TradingEngine.__init__ via __new__ and sets
+    # all attributes directly.  The pairs parameter here sets engine._pairs
+    # directly — no constructor call, so _load_discovered_pairs is not invoked.
     """
     Construct a TradingEngine via __new__ with all dependencies replaced by
     MagicMock instances.  Returns (engine, mock_storage, mock_alpaca, mock_mwu).
@@ -667,19 +670,235 @@ class TestMainArgParsing:
         args = _build_parser().parse_args(["--live"])
         assert args.live is True
 
-    def test_pair_parsing(self):
-        from trading_engine.main import _parse_pair
-        assert _parse_pair("JPM,BAC") == ("JPM", "BAC")
+    def test_pairs_file_defaults_to_none(self):
+        from trading_engine.main import _build_parser
+        args = _build_parser().parse_args([])
+        assert args.pairs_file is None
 
-    def test_pair_parsing_case_insensitive(self):
-        from trading_engine.main import _parse_pair
-        assert _parse_pair("jpm,bac") == ("JPM", "BAC")
+    def test_pairs_file_custom_path(self, tmp_path):
+        from trading_engine.main import _build_parser
+        pairs_path = tmp_path / "my_pairs.json"
+        args = _build_parser().parse_args(["--pairs-file", str(pairs_path)])
+        assert args.pairs_file == pairs_path
 
-    def test_invalid_pair_raises(self):
-        from trading_engine.main import _parse_pair
-        import argparse
-        with pytest.raises(argparse.ArgumentTypeError):
-            _parse_pair("AAPL")
+
+# ===========================================================================
+# _load_discovered_pairs
+# ===========================================================================
+
+class TestLoadDiscoveredPairs:
+
+    def test_missing_file_returns_empty_list(self, tmp_path):
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        result = _load_discovered_pairs(tmp_path / "nonexistent.json")
+        assert result == []
+
+    def test_valid_file_returns_pairs(self, tmp_path):
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        path = tmp_path / "discovered_pairs.json"
+        payload = {
+            "scanned_at": "2026-04-08T12:00:00Z",
+            "lookback_days": 504,
+            "n_tickers_scanned": 10,
+            "n_candidate_pairs": 45,
+            "n_correlated": 5,
+            "n_cointegrated": 3,
+            "n_selected": 2,
+            "pairs": [
+                {"ticker1": "LMT", "ticker2": "NOC", "eg_pvalue": 0.01,
+                 "correlation": 0.91, "johansen_trace_stat": 18.4,
+                 "beta_ols": 1.23, "half_life_bars": 18.3,
+                 "kappa": 0.038, "mu": 0.12, "sigma": 2.45},
+                {"ticker1": "MSFT", "ticker2": "GOOG", "eg_pvalue": 0.03,
+                 "correlation": 0.85, "johansen_trace_stat": 14.2,
+                 "beta_ols": 0.87, "half_life_bars": 22.1,
+                 "kappa": 0.031, "mu": 0.05, "sigma": 3.10},
+            ],
+        }
+        path.write_text(json.dumps(payload))
+        result = _load_discovered_pairs(path)
+        assert result == [("LMT", "NOC"), ("MSFT", "GOOG")]
+
+    def test_malformed_json_returns_empty_list(self, tmp_path):
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        path = tmp_path / "bad.json"
+        path.write_text("{not valid json")
+        result = _load_discovered_pairs(path)
+        assert result == []
+
+    def test_empty_pairs_list(self, tmp_path):
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        path = tmp_path / "empty.json"
+        path.write_text(json.dumps({
+            "scanned_at": "2026-04-08T12:00:00Z",
+            "pairs": [],
+        }))
+        result = _load_discovered_pairs(path)
+        assert result == []
+
+    def test_stale_file_returns_pairs_with_warning(self, tmp_path, capsys):
+        """A file >14 days old must still return pairs (with a warning)."""
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        path = tmp_path / "stale.json"
+        # scanned_at 30 days ago
+        from datetime import timedelta
+        stale_ts = (
+            datetime.now(tz=timezone.utc) - timedelta(days=30)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {
+            "scanned_at": stale_ts,
+            "pairs": [
+                {"ticker1": "JPM", "ticker2": "BAC",
+                 "eg_pvalue": 0.02, "correlation": 0.88,
+                 "johansen_trace_stat": 16.0, "beta_ols": 1.1,
+                 "half_life_bars": 15.0, "kappa": 0.046,
+                 "mu": 0.0, "sigma": 1.5},
+            ],
+        }
+        path.write_text(json.dumps(payload))
+
+        result = _load_discovered_pairs(path)
+        # Pairs must still be returned despite staleness
+        assert result == [("JPM", "BAC")]
+        # Warning must have been logged (structlog goes to stdout)
+        captured = capsys.readouterr()
+        assert "stale" in captured.out
+
+    def test_pair_entry_missing_ticker_key_skipped(self, tmp_path):
+        from trading_engine.orchestrator.engine import _load_discovered_pairs
+        path = tmp_path / "partial.json"
+        path.write_text(json.dumps({
+            "scanned_at": "2026-04-08T12:00:00Z",
+            "pairs": [
+                {"ticker1": "LMT"},                       # missing ticker2
+                {"ticker1": "MSFT", "ticker2": "GOOG"},   # valid
+            ],
+        }))
+        result = _load_discovered_pairs(path)
+        assert result == [("MSFT", "GOOG")]
+
+
+# ===========================================================================
+# Pair ticker auto-merge
+# ===========================================================================
+
+_LOAD_PAIRS = f"{_ENG_MOD}._load_discovered_pairs"
+_PO_MOD = f"{_ENG_MOD}.PortfolioOptimizer"
+
+
+class TestPairTickerAutoMerge:
+    """
+    Test that pair tickers discovered in discovered_pairs.json are merged into
+    self._tickers at TradingEngine.__init__ time.
+    """
+
+    @patch(f"{_ENG_MOD}.StateManager")
+    @patch(_PO_MOD)
+    @patch(f"{_ENG_MOD}.OrderExecutor")
+    @patch(f"{_ENG_MOD}.RiskManager")
+    @patch(f"{_ENG_MOD}.OUSpreadSignal")
+    @patch(f"{_ENG_MOD}.MWUMetaAgent")
+    @patch(f"{_ENG_MOD}.LLMSentimentSignal")
+    @patch(f"{_ENG_MOD}.HMMRegimeDetector")
+    @patch(f"{_ENG_MOD}.AlphaVantageNewsClient")
+    @patch(f"{_ENG_MOD}.AlpacaMarketData")
+    @patch(f"{_ENG_MOD}.Storage")
+    @patch(_LOAD_PAIRS)
+    def test_pair_tickers_added_to_tickers(
+        self,
+        mock_load_pairs,
+        mock_storage_cls, mock_alpaca_cls, mock_av_cls,
+        mock_hmm_cls, mock_llm_cls, mock_mwu_cls, mock_ou_cls,
+        mock_risk_cls, mock_exec_cls, mock_po_cls,
+        mock_state_cls,
+        tmp_path,
+    ):
+        """Tickers in discovered pairs must be merged into engine._tickers."""
+        mock_load_pairs.return_value = [("LMT", "NOC")]
+
+        # State manager returns None on load (fresh state)
+        mock_state_cls.return_value.load.return_value = None
+
+        from trading_engine.orchestrator.engine import TradingEngine
+        engine = TradingEngine(
+            tickers=["AAPL"],
+            paper=True,
+            models_dir=tmp_path,
+        )
+
+        assert "LMT" in engine._tickers
+        assert "NOC" in engine._tickers
+        assert "AAPL" in engine._tickers
+
+    @patch(f"{_ENG_MOD}.StateManager")
+    @patch(_PO_MOD)
+    @patch(f"{_ENG_MOD}.OrderExecutor")
+    @patch(f"{_ENG_MOD}.RiskManager")
+    @patch(f"{_ENG_MOD}.OUSpreadSignal")
+    @patch(f"{_ENG_MOD}.MWUMetaAgent")
+    @patch(f"{_ENG_MOD}.LLMSentimentSignal")
+    @patch(f"{_ENG_MOD}.HMMRegimeDetector")
+    @patch(f"{_ENG_MOD}.AlphaVantageNewsClient")
+    @patch(f"{_ENG_MOD}.AlpacaMarketData")
+    @patch(f"{_ENG_MOD}.Storage")
+    @patch(_LOAD_PAIRS)
+    def test_already_present_tickers_not_duplicated(
+        self,
+        mock_load_pairs,
+        mock_storage_cls, mock_alpaca_cls, mock_av_cls,
+        mock_hmm_cls, mock_llm_cls, mock_mwu_cls, mock_ou_cls,
+        mock_risk_cls, mock_exec_cls, mock_po_cls,
+        mock_state_cls,
+        tmp_path,
+    ):
+        """Pair tickers already in --tickers must not be duplicated."""
+        mock_load_pairs.return_value = [("AAPL", "MSFT")]
+        mock_state_cls.return_value.load.return_value = None
+
+        from trading_engine.orchestrator.engine import TradingEngine
+        engine = TradingEngine(
+            tickers=["AAPL", "MSFT"],
+            paper=True,
+            models_dir=tmp_path,
+        )
+
+        assert engine._tickers.count("AAPL") == 1
+        assert engine._tickers.count("MSFT") == 1
+
+    @patch(f"{_ENG_MOD}.StateManager")
+    @patch(_PO_MOD)
+    @patch(f"{_ENG_MOD}.OrderExecutor")
+    @patch(f"{_ENG_MOD}.RiskManager")
+    @patch(f"{_ENG_MOD}.OUSpreadSignal")
+    @patch(f"{_ENG_MOD}.MWUMetaAgent")
+    @patch(f"{_ENG_MOD}.LLMSentimentSignal")
+    @patch(f"{_ENG_MOD}.HMMRegimeDetector")
+    @patch(f"{_ENG_MOD}.AlphaVantageNewsClient")
+    @patch(f"{_ENG_MOD}.AlpacaMarketData")
+    @patch(f"{_ENG_MOD}.Storage")
+    @patch(_LOAD_PAIRS)
+    def test_no_pairs_file_engine_runs_without_pairs(
+        self,
+        mock_load_pairs,
+        mock_storage_cls, mock_alpaca_cls, mock_av_cls,
+        mock_hmm_cls, mock_llm_cls, mock_mwu_cls, mock_ou_cls,
+        mock_risk_cls, mock_exec_cls, mock_po_cls,
+        mock_state_cls,
+        tmp_path,
+    ):
+        """When _load_discovered_pairs returns [], engine._pairs is empty."""
+        mock_load_pairs.return_value = []
+        mock_state_cls.return_value.load.return_value = None
+
+        from trading_engine.orchestrator.engine import TradingEngine
+        engine = TradingEngine(
+            tickers=["AAPL"],
+            paper=True,
+            models_dir=tmp_path,
+        )
+
+        assert engine._pairs == []
+        assert engine._tickers == ["AAPL"]
 
 
 # ===========================================================================

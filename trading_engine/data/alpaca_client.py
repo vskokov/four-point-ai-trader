@@ -223,6 +223,76 @@ class AlpacaMarketData:
         return df
 
     # ------------------------------------------------------------------
+    # Historical bars (wide form, no DB write)
+    # ------------------------------------------------------------------
+
+    def get_historical_bars(
+        self,
+        tickers: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: str = "1Day",
+    ) -> pd.DataFrame:
+        """
+        Fetch close prices for *tickers* without writing to storage.
+
+        Returns
+        -------
+        pd.DataFrame
+            Wide-form: index = dates (DatetimeIndex, UTC), columns = tickers,
+            values = daily close price.  Missing bars are ``NaN``.
+        """
+        if timeframe not in _TIMEFRAME_MAP:
+            raise ValueError(
+                f"Unsupported timeframe {timeframe!r}. "
+                f"Choose from {list(_TIMEFRAME_MAP)}"
+            )
+
+        logger.info(
+            "alpaca_market.get_historical_bars.start",
+            tickers=tickers,
+            start=str(start),
+            end=str(end),
+            timeframe=timeframe,
+        )
+
+        request = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=_TIMEFRAME_MAP[timeframe],
+            start=start,
+            end=end,
+        )
+        bar_set = _with_retry(
+            lambda: self._hist.get_stock_bars(request),
+            label="get_historical_bars",
+        )
+
+        # Build wide-form dict: date → {ticker: close}
+        rows: dict[Any, dict[str, float]] = {}
+        for ticker in tickers:
+            for bar in bar_set.data.get(ticker, []):
+                date_key = pd.Timestamp(bar.timestamp).normalize()
+                if date_key not in rows:
+                    rows[date_key] = {}
+                rows[date_key][ticker] = float(bar.close)
+
+        if not rows:
+            df = pd.DataFrame(columns=tickers, dtype=float)
+            df.index = pd.DatetimeIndex([], name="time", tz="UTC")
+            return df
+
+        df = pd.DataFrame.from_dict(rows, orient="index")
+        df.index = pd.DatetimeIndex(df.index, tz="UTC", name="time")
+        df = df.sort_index().reindex(columns=tickers)
+
+        logger.info(
+            "alpaca_market.get_historical_bars.done",
+            tickers=tickers,
+            rows=len(df),
+        )
+        return df
+
+    # ------------------------------------------------------------------
     # Latest quote
     # ------------------------------------------------------------------
 

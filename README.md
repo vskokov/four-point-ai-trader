@@ -3,24 +3,27 @@
 An autonomous stock trading engine for Alpaca paper (and live) trading. The
 system ingests real-time market data and news, detects market regimes, computes
 ensemble signals, sizes positions with fractional Kelly criterion, enforces
-mandatory risk controls, and routes orders — all driven by a local LLM
-(Ollama / Gemma) for news sentiment.
+mandatory risk controls, optimises a portfolio daily via Black-Litterman, and
+routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 
 ```
-                          ┌─────────────────────────────────────────┐
-                          │            TradingEngine (orchestrator)  │
-                          │                                         │
-  Alpaca WebSocket ───────┤► bar_handler()                          │
-                          │    │                                    │
-  APScheduler ────────────┤    ├─► HMMRegimeDetector                │
-    sentiment (4 h)        │    ├─► KalmanHedgeRatio + OUSpreadSignal│
-    eod_job (16:05 ET)     │    ├─► LLM signal (from signal_log)    │
-                          │    └─► MWUMetaAgent.scheduled_update()  │
-                          │              │                          │
-                          │              └─► OrderExecutor          │
-                          │                    RiskManager          │
-                          │                    circuit breaker      │
-                          └─────────────────────────────────────────┘
+                          ┌──────────────────────────────────────────────────┐
+                          │              TradingEngine (orchestrator)         │
+                          │                                                  │
+  pair_scanner.py ───────►│  config/discovered_pairs.json                   │
+  (run weekly)            │         │ (read at startup)                      │
+                          │         ▼                                        │
+  Alpaca WebSocket ───────┤► bar_handler()                                  │
+                          │    │                                             │
+  APScheduler ────────────┤    ├─► HMMRegimeDetector                        │
+    sentiment (25/35 min)  │    ├─► KalmanHedgeRatio + OUSpreadSignal        │
+    market_open (09:31 ET) │    ├─► LLM signal (from signal_log)            │
+    eod_job (16:05 ET)     │    └─► MWUMetaAgent.scheduled_update()         │
+                          │              │                                   │
+                          │              └─► OrderExecutor                  │
+                          │                    RiskManager (Kelly + CBs)    │
+                          │                    PortfolioOptimizer (BL/MV)   │
+                          └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -30,14 +33,16 @@ mandatory risk controls, and routes orders — all driven by a local LLM
 | Layer | Capability |
 |---|---|
 | **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpha Vantage news with rate-limit tracking |
+| **Pair discovery** | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON |
 | **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
-| **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic Engle-Granger cointegration health checks |
+| **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
 | **LLM sentiment** | Local Ollama (Gemma 4 e4b) scores news headlines into directional signals; retries on malformed JSON; 60-second timeout → safe neutral fallback |
 | **Meta-agent** | Multiplicative Weights Update (MWU) ensemble conditioned on HMM regime; per-regime weight isolation; online learning from realised price directions |
 | **Backtesting** | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results |
+| **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys) |
 | **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 %); peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
 | **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions` |
-| **Orchestration** | APScheduler (interval sentiment job + cron EOD job); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
+| **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
 
 ---
 
@@ -49,7 +54,8 @@ mandatory risk controls, and routes orders — all driven by a local LLM
 trading_engine/
 ├── config/
 │   ├── settings.py              # All constants loaded from .env
-│   └── av_rate_state.json       # Auto-created; Alpha Vantage daily call counter
+│   ├── av_rate_state.json       # Auto-created; Alpha Vantage daily call counter
+│   └── discovered_pairs.json    # Written by pair_scanner.py; read at engine startup
 ├── data/
 │   ├── storage.py               # TimescaleDB — OHLCV, signals, regimes, news
 │   ├── alpaca_client.py         # AlpacaMarketData (bars, quotes, account, stream)
@@ -69,10 +75,17 @@ trading_engine/
 ├── orchestrator/
 │   ├── engine.py                # TradingEngine — top-level loop
 │   └── state_manager.py         # Atomic JSON state persistence + checksum
+├── portfolio/
+│   └── portfolio_optimizer.py   # PortfolioOptimizer (Black-Litterman + Min-Variance)
+├── tools/
+│   └── pair_scanner.py          # Standalone pair discovery CLI (run weekly)
 ├── models/                      # Auto-created; HMM .pkl, Kalman .pkl, MWU .npy
 ├── utils/
 │   └── logging.py               # structlog factory (JSON file + console)
-├── tests/                       # 327 unit tests — no live connections required
+├── tests/                       # 392 unit tests — no live connections required
+│   ├── tools/
+│   │   └── test_pair_scanner.py
+│   └── ...
 ├── main.py                      # CLI entry point
 ├── requirements.txt
 ├── docker-compose.yml           # TimescaleDB container
@@ -188,22 +201,53 @@ python -m venv .venv
 
 ## Running
 
-### Paper trading (default)
+### Step 1 — Discover pairs (run weekly)
+
+Before starting the engine for the first time, scan your ticker universe for
+cointegrated pairs. Results are written to `config/discovered_pairs.json` and
+loaded automatically at engine startup.
+
+```bash
+cd trading_engine
+.venv/bin/python -m trading_engine.tools.pair_scanner \
+    --tickers LMT NOC RTX GD BA MSFT GOOG AAPL NVDA AMD \
+    --lookback-days 504 \
+    --min-correlation 0.70 \
+    --max-pvalue 0.05 \
+    --min-half-life 5 \
+    --max-half-life 60 \
+    --max-pairs 10
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tickers` | required | Ticker universe to scan |
+| `--lookback-days` | 504 | Calendar days of history (~2 trading years) |
+| `--output` | `config/discovered_pairs.json` | Output file path |
+| `--min-correlation` | 0.70 | Minimum log-return Pearson correlation |
+| `--max-pvalue` | 0.05 | Maximum Engle-Granger p-value |
+| `--min-half-life` | 5 | Minimum OU half-life in bars (too fast = noise) |
+| `--max-half-life` | 60 | Maximum OU half-life in bars (too slow = no opportunity) |
+| `--max-pairs` | 10 | Maximum output pairs (ranked by EG p-value) |
+
+### Step 2 — Run the engine
 
 ```bash
 cd trading_engine
 .venv/bin/python -m trading_engine.main \
     --tickers AAPL MSFT JPM BAC \
-    --pairs JPM,BAC \
     --log-level INFO
 ```
+
+The engine reads `config/discovered_pairs.json` at startup and automatically
+merges pair tickers into the subscription universe. If the file is missing the
+engine still runs on HMM + LLM signals only.
 
 ### Live trading
 
 ```bash
 .venv/bin/python -m trading_engine.main \
     --tickers AAPL MSFT \
-    --pairs \
     --live \
     --log-file /var/log/trader.json
 ```
@@ -212,17 +256,17 @@ cd trading_engine
 
 ```
 usage: four-point-trader [--tickers TICKER [TICKER ...]]
-                         [--pairs T1,T2 [T1,T2 ...]]
+                         [--pairs-file PATH]
                          [--live]
                          [--log-level {DEBUG,INFO,WARNING,ERROR}]
                          [--log-file PATH]
 
 options:
-  --tickers   Equity symbols to trade (default: AAPL MSFT JPM BAC)
-  --pairs     Cointegrated pairs for OU mean-reversion (e.g. JPM,BAC)
-  --live      Connect to Alpaca live trading  [paper is default]
-  --log-level Logging verbosity (default: INFO)
-  --log-file  Optional path for newline-delimited JSON log file
+  --tickers     Equity symbols to trade (default: AAPL MSFT JPM BAC)
+  --pairs-file  Path to discovered_pairs.json (default: config/discovered_pairs.json)
+  --live        Connect to Alpaca live trading  [paper is default]
+  --log-level   Logging verbosity (default: INFO)
+  --log-file    Optional path for newline-delimited JSON log file
 ```
 
 Shutdown cleanly with `Ctrl-C` or `SIGTERM`. If the circuit breaker fires, all
@@ -240,9 +284,10 @@ positions are liquidated before exit.
 | Kelly fraction | ¼ Kelly | `RiskManager.kelly_fraction` |
 | Order type | Market / DAY | No limit orders; sells capped at held quantity |
 
-The circuit breaker fires **before** any order on every bar. If triggered it
-sets an emergency flag, signals the shutdown event, and `close_all_positions`
-is called during the shutdown sequence.
+The circuit breaker fires **before** any order on every bar and before every
+portfolio rebalance. If triggered it sets an emergency flag, signals the
+shutdown event, and `close_all_positions` is called during the shutdown
+sequence.
 
 ---
 
@@ -251,7 +296,7 @@ is called during the shutdown sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 327 tests, no live connections required
+# Unit tests — 392 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -260,7 +305,9 @@ cd trading_engine
                  tests/backtesting/test_backtest_engine.py \
                  tests/meta_agent/test_mwu_agent.py \
                  tests/execution/test_executor.py \
-                 tests/test_engine.py -v
+                 tests/test_engine.py \
+                 tests/portfolio/ \
+                 tests/tools/ -v
 
 # Integration tests — require live TimescaleDB
 TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
@@ -277,9 +324,11 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
 | `test_executor.py` | 41 | RiskManager, Kelly sizing, OrderExecutor |
-| `test_engine.py` | 46 | TradingEngine bar_handler, jobs, shutdown, StateManager |
+| `test_engine.py` | 59 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading |
+| `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
+| `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **327** | |
+| **Total (unit)** | **392** | |
 
 ---
 
@@ -303,8 +352,14 @@ HMM models, Kalman filters, and MWU weights are persisted by their own modules
 
 | Job | Trigger | Action |
 |---|---|---|
-| `sentiment_job` | Every 4 hours (market hours only, 09:30–16:00 ET) | Alpha Vantage fetch → Gemma scoring → `signal_log` insert |
+| `sentiment_job_early` | Every 25 min, 07:00–10:29 ET Mon–Fri | Alpha Vantage fetch → Gemma scoring → `signal_log` insert |
+| `sentiment_job_late` | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (different cadence for budget management) |
+| `market_open_job` | 09:31 ET Mon–Fri | Black-Litterman portfolio optimisation → rebalance execution |
 | `eod_job` | 16:05 ET Mon–Fri | P&L log, MWU performance report, Kelly stat refresh, state save |
+
+Alpha Vantage budget: ~8 (early) + ~10 (late) ≈ 18 calls/day out of the 25
+free-tier limit. A soft guard at 20 calls skips the run; the hard limit (raise)
+is also at 20.
 
 ---
 
@@ -317,6 +372,8 @@ HMM models, Kalman filters, and MWU weights are persisted by their own modules
 | 3 — Backtesting | BacktestEngine (vectorbt), walk-forward, bias checks | Complete |
 | 4 — Meta-agent | MWU ensemble conditioned on HMM regime | Complete |
 | 5 — Execution | Fractional Kelly sizing, risk controls, order routing, orchestration | Complete |
+| 6 — Portfolio | Black-Litterman + Min-Variance optimisation, daily rebalance | Complete |
+| 7 — Pair discovery | Standalone cointegration scanner, JSON-driven pair loading | Complete |
 
 ---
 
