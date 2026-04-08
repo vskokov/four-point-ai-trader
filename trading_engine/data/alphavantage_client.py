@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,7 @@ class AlphaVantageNewsClient:
     def __init__(self, rate_state_path: Path | None = None) -> None:
         self._api_key = settings.ALPHAVANTAGE_API_KEY
         self._rate_state_path = rate_state_path or _DEFAULT_RATE_STATE_PATH
+        self._recent_call_times: list[float] = []
         logger.info("av_client.init", rate_state=str(self._rate_state_path))
 
     # ------------------------------------------------------------------
@@ -127,6 +129,56 @@ class AlphaVantageNewsClient:
         return count
 
     # ------------------------------------------------------------------
+    # Per-minute rate guard
+    # ------------------------------------------------------------------
+
+    def _enforce_per_minute_limit(self, max_per_minute: int = 5) -> None:
+        """
+        Block until making another call would not exceed *max_per_minute* within
+        any rolling 60-second window.  Uses ``time.monotonic`` timestamps stored
+        in ``_recent_call_times``.
+
+        On a typical run the free-tier pattern is 1 call per pipeline run, so
+        this guard should never trigger — it is a safety net only.
+        """
+        now = time.monotonic()
+        # Prune entries older than 60 seconds
+        self._recent_call_times = [t for t in self._recent_call_times if now - t < 60]
+
+        if len(self._recent_call_times) >= max_per_minute:
+            # Sleep until the oldest entry falls outside the 60-second window
+            sleep_duration = 60.0 - (now - self._recent_call_times[0])
+            if sleep_duration > 0:
+                logger.debug(
+                    "av_client.per_minute_limit.sleeping",
+                    sleep_seconds=round(sleep_duration, 1),
+                )
+                time.sleep(sleep_duration)
+                # Prune again after waking
+                now = time.monotonic()
+                self._recent_call_times = [
+                    t for t in self._recent_call_times if now - t < 60
+                ]
+
+        self._recent_call_times.append(now)
+
+    # ------------------------------------------------------------------
+    # Daily call count (public, for external budget checks)
+    # ------------------------------------------------------------------
+
+    def get_daily_call_count(self) -> int:
+        """
+        Return the number of AV API calls made today (resets at midnight).
+
+        Reads from the same rate-state file used by ``_check_and_increment``.
+        Returns 0 if the file is missing or was last updated on a different day.
+        """
+        state = self._load_rate_state()
+        if state.get("date") != date.today().isoformat():
+            return 0
+        return int(state.get("count", 0))
+
+    # ------------------------------------------------------------------
     # News fetch
     # ------------------------------------------------------------------
 
@@ -179,13 +231,14 @@ class AlphaVantageNewsClient:
             time_from=time_from,
         )
 
+        self._enforce_per_minute_limit()
         self._check_and_increment()
 
         params: dict[str, str] = {
             "function": "NEWS_SENTIMENT",
             "tickers":  ",".join(tickers),
             "time_from": time_from,
-            "limit":    "50",
+            "limit":    "200",
             "apikey":   self._api_key,
         }
 

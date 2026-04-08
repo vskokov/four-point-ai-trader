@@ -439,8 +439,9 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     collects `last_decision` from every per-ticker `MWUMetaAgent`, converts the
     `weights` dict max value to a confidence proxy, and calls
     `compute_black_litterman`.  All exceptions are caught; a min-variance
-    fallback is attempted on failure.  The engine now registers 3 APScheduler
-    jobs (sentiment, market_open, eod) — tests asserting job count must expect 3.
+    fallback is attempted on failure.  The engine now registers 4 APScheduler
+    jobs (sentiment_early, sentiment_late, market_open, eod) — tests asserting
+    job count must expect 4.
 
 44. **`OrderExecutor.portfolio_optimizer` defaults to `None`** — when `None`,
     Kelly sizing is used unchanged.  When set, a non-zero `get_target_weight`
@@ -468,3 +469,40 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     (`engine.rebalance.summary`) is emitted at the end with `n_executed`,
     `n_skipped`, and `n_errors` counts.  Tests that verify isolation must check
     that `submit_order` was called N times even when one call raises.
+
+48. **`run_pipeline` fetches news for all tickers in a single `fetch_news()` call** —
+    articles are grouped by the `"ticker"` field already present in each dict from
+    `_parse_feed`.  This keeps AV usage to 1 call per pipeline run instead of N.
+    The `limit` param is set to `"200"` to accommodate the larger multi-ticker
+    response.  Tests that previously used `fetch_news.side_effect` with one item
+    per ticker must be updated to use `fetch_news.return_value` with a combined list.
+
+49. **`_human_age()` formats headline age as a human-readable bracket prefix** —
+    e.g. `[2 hours 30 minutes ago]`.  The `now` parameter exists for testability;
+    production code omits it (defaults to `datetime.now(utc)`).  Tests must pass
+    a fixed `now` to get deterministic assertions.  The function uses singular
+    forms ("1 minute", "1 hour", "1 day") and omits the sub-unit when it is zero
+    (e.g. `[1 hour ago]` not `[1 hour 0 minutes ago]`).
+
+50. **Per-minute rate guard (`_enforce_per_minute_limit`) uses `time.monotonic()`
+    timestamps** stored in `_recent_call_times`, pruned to a 60-second window.
+    If 5+ calls exist in the window, it sleeps until the oldest entry expires.
+    With the single-call-per-pipeline pattern, this should never trigger in normal
+    operation — it is a safety net.  Tests must patch `trading_engine.data.alphavantage_client.time`
+    (the module-level import) to control both `monotonic` and `sleep`.
+
+51. **Sentiment scheduling uses two cron jobs** — `sentiment_job_early` (every
+    25 min, 07:00–10:29 ET) and `sentiment_job_late` (every 35 min, 10:30–16:30 ET).
+    Budget math: ~8 + ~10 = ~18 calls/day.  `sentiment_job()` has a soft budget
+    check that skips the run if `get_daily_call_count() >= 20`; the hard limit
+    (raises `RateLimitExceeded`) remains at 20 in `_check_and_increment()`.
+    Total APScheduler jobs is now 4.  `sentiment_job()` no longer has its own
+    market-hours guard — the cron windows handle that.  Tests must configure
+    `engine._av_client.get_daily_call_count.return_value` to an int (default
+    MagicMock comparison with `>= 20` is truthy and would skip the job).
+
+52. **`hours_back` defaults to 2 (was 8)** — with runs every 25–35 minutes, the
+    long lookback is unnecessary.  The in-process `_seen_hashes` dedup cache
+    ensures headlines are not re-scored across overlapping windows.  On a fresh
+    engine restart, `_seen_hashes` is empty so the first run may re-score recent
+    headlines — this is acceptable and self-corrects after one cycle.

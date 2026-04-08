@@ -325,45 +325,38 @@ class TestBarHandler:
 # ===========================================================================
 
 class TestSentimentJob:
+    """
+    sentiment_job() no longer checks market hours (cron triggers handle that).
+    It checks the AV daily call count and skips if >= 20.
+    """
 
-    def _make_engine_for_sentiment(self, tmp_path, market_open: bool):
+    def test_runs_when_budget_ok(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-
-        if market_open:
-            # 10:00 AM ET Tuesday → market open
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            fake_now = datetime(2025, 1, 14, 10, 0, 0, tzinfo=ZoneInfo("America/New_York"))
-        else:
-            # 8:00 PM ET → closed
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            fake_now = datetime(2025, 1, 14, 20, 0, 0, tzinfo=ZoneInfo("America/New_York"))
-
-        return engine, fake_now
-
-    def test_runs_during_market_hours(self, tmp_path):
-        engine, fake_now = self._make_engine_for_sentiment(tmp_path, market_open=True)
-        with patch(f"{_ENG_MOD}.datetime") as mock_dt:
-            mock_dt.now.return_value = fake_now
-            engine.sentiment_job()
+        engine._av_client.get_daily_call_count.return_value = 0
+        engine.sentiment_job()
         engine._llm.run_pipeline.assert_called_once_with(
             engine._tickers, engine._av_client, engine._storage
         )
 
-    def test_skipped_outside_market_hours(self, tmp_path):
-        engine, fake_now = self._make_engine_for_sentiment(tmp_path, market_open=False)
-        with patch(f"{_ENG_MOD}.datetime") as mock_dt:
-            mock_dt.now.return_value = fake_now
-            engine.sentiment_job()
+    def test_skipped_when_daily_budget_reached(self, tmp_path):
+        """At 20 calls, sentiment_job must skip run_pipeline."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._av_client.get_daily_call_count.return_value = 20
+        engine.sentiment_job()
         engine._llm.run_pipeline.assert_not_called()
 
+    def test_runs_at_nineteen_calls(self, tmp_path):
+        """At 19 calls (one below the threshold), run_pipeline must still be called."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._av_client.get_daily_call_count.return_value = 19
+        engine.sentiment_job()
+        engine._llm.run_pipeline.assert_called_once()
+
     def test_exception_does_not_propagate(self, tmp_path):
-        engine, fake_now = self._make_engine_for_sentiment(tmp_path, market_open=True)
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._av_client.get_daily_call_count.return_value = 0
         engine._llm.run_pipeline.side_effect = RuntimeError("AV rate limit")
-        with patch(f"{_ENG_MOD}.datetime") as mock_dt:
-            mock_dt.now.return_value = fake_now
-            engine.sentiment_job()   # should not raise
+        engine.sentiment_job()   # should not raise
 
 
 # ===========================================================================
@@ -403,22 +396,32 @@ class TestEODJob:
 
 class TestSchedulerSetup:
 
-    def test_three_jobs_registered(self, tmp_path):
+    def test_four_jobs_registered(self, tmp_path):
+        """run() must register 4 APScheduler jobs: 2 sentiment + market_open + eod."""
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
 
         mock_scheduler = MagicMock()
         mock_scheduler.running = False
 
         with patch(_SCHEDULER, return_value=mock_scheduler):
-            # Simulate run() up to just after scheduler.add_job calls by
-            # calling the job-registration portion directly.
             engine._scheduler = mock_scheduler
             engine._scheduler.add_job(
                 engine.sentiment_job,
-                "interval",
-                hours=4,
-                id="sentiment_job",
-                next_run_time=datetime.now(tz=timezone.utc),
+                "cron",
+                hour="7-10",
+                minute="*/25",
+                day_of_week="mon-fri",
+                timezone="America/New_York",
+                id="sentiment_job_early",
+            )
+            engine._scheduler.add_job(
+                engine.sentiment_job,
+                "cron",
+                hour="10-16",
+                minute="*/35",
+                day_of_week="mon-fri",
+                timezone="America/New_York",
+                id="sentiment_job_late",
             )
             engine._scheduler.add_job(
                 engine.market_open_job,
@@ -439,26 +442,36 @@ class TestSchedulerSetup:
                 id="eod_job",
             )
 
-        assert mock_scheduler.add_job.call_count == 3
+        assert mock_scheduler.add_job.call_count == 4
 
-    def test_sentiment_job_registered_as_interval(self, tmp_path):
+    def test_sentiment_jobs_registered_as_cron(self, tmp_path):
+        """Both sentiment jobs must use cron triggers with correct hour ranges."""
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
         mock_scheduler = MagicMock()
 
         engine._scheduler = mock_scheduler
         engine._scheduler.add_job(
-            engine.sentiment_job, "interval", hours=4, id="sentiment_job",
-            next_run_time=datetime.now(tz=timezone.utc),
+            engine.sentiment_job, "cron", hour="7-10", minute="*/25",
+            day_of_week="mon-fri", timezone="America/New_York",
+            id="sentiment_job_early",
         )
         engine._scheduler.add_job(
-            engine.eod_job, "cron", day_of_week="mon-fri", hour=16, minute=5,
-            timezone="America/New_York", id="eod_job",
+            engine.sentiment_job, "cron", hour="10-16", minute="*/35",
+            day_of_week="mon-fri", timezone="America/New_York",
+            id="sentiment_job_late",
         )
 
         calls = mock_scheduler.add_job.call_args_list
+        # Both must be "cron" trigger
         triggers = [c[0][1] for c in calls]
-        assert "interval" in triggers
-        assert "cron" in triggers
+        assert all(t == "cron" for t in triggers)
+        # Verify hour ranges and minute intervals
+        early_kwargs = calls[0][1]
+        late_kwargs  = calls[1][1]
+        assert early_kwargs["hour"] == "7-10"
+        assert early_kwargs["minute"] == "*/25"
+        assert late_kwargs["hour"] == "10-16"
+        assert late_kwargs["minute"] == "*/35"
 
     def test_eod_job_scheduled_at_1605_et(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)

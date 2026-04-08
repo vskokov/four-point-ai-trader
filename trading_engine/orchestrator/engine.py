@@ -5,8 +5,10 @@ Wires together every module built in Phases 1–5 and drives the real-time
 trading lifecycle:
 
   stream_bars WebSocket  →  bar_handler  →  HMM / OU / LLM / MWU  →  Executor
-  APScheduler            →  sentiment_job (every 4 h, market hours)
-                         →  eod_job       (16:05 ET, mon-fri)
+  APScheduler            →  sentiment_job_early (every 25 min, 07:00–10:29 ET, mon-fri)
+                         →  sentiment_job_late  (every 35 min, 10:30–16:30 ET, mon-fri)
+                         →  market_open_job     (09:31 ET, mon-fri)
+                         →  eod_job             (16:05 ET, mon-fri)
 """
 
 from __future__ import annotations
@@ -444,24 +446,25 @@ class TradingEngine:
         """
         Fetch news and run LLM sentiment pipeline.
 
-        Runs every 4 hours via APScheduler.  Includes an internal market-hours
-        guard so it silently skips outside NYSE core session (09:30–16:00 ET,
-        Mon–Fri).
-        """
-        now_et = datetime.now(tz=_ET)
-        is_weekday = now_et.weekday() < 5
-        after_open  = (now_et.hour, now_et.minute) >= (9, 30)
-        before_close = (now_et.hour, now_et.minute) < (16, 0)
+        Invoked by two APScheduler cron jobs:
+          - ``sentiment_job_early``: every 25 min, 07:00–10:29 ET, Mon–Fri
+          - ``sentiment_job_late``:  every 35 min, 10:30–16:30 ET, Mon–Fri
 
-        if not (is_weekday and after_open and before_close):
-            logger.debug(
+        Includes a soft budget guard: if the AV daily call count has already
+        reached 20 (the hard limit in ``_check_and_increment``), the run is
+        skipped to avoid raising ``RateLimitExceeded``.  The hard limit in
+        ``AlphaVantageNewsClient`` remains the authoritative cap.
+        """
+        count = self._av_client.get_daily_call_count()
+        if count >= 20:
+            logger.warning(
                 "engine.sentiment_job.skipped",
-                reason="outside_market_hours",
-                now_et=now_et.isoformat(),
+                reason="daily_budget_reached",
+                calls_today=count,
             )
             return
 
-        logger.info("engine.sentiment_job.start")
+        logger.info("engine.sentiment_job.start", calls_today=count)
         try:
             results = self._llm.run_pipeline(
                 self._tickers, self._av_client, self._storage
@@ -702,8 +705,8 @@ class TradingEngine:
         """
         Start the trading engine.
 
-        1. Configure APScheduler with sentiment (every 4 h) and EOD (16:05 ET)
-           jobs.
+        1. Configure APScheduler with two sentiment cron windows and EOD (16:05 ET)
+           jobs — 4 jobs total.
         2. Start the Alpaca WebSocket bar stream (background thread).
         3. Block until ``KeyboardInterrupt`` or the circuit-breaker fires.
         4. On shutdown: persist state; close all positions if emergency flag set.
@@ -716,12 +719,25 @@ class TradingEngine:
             job_defaults={"misfire_grace_time": 300},
         )
 
+        # Sentiment job — two cron windows to cover pre-market through close.
+        # Budget math: ~8 calls (early) + ~10 calls (late) ≈ 18 calls/day.
         self._scheduler.add_job(
             self.sentiment_job,
-            "interval",
-            hours=4,
-            id="sentiment_job",
-            next_run_time=datetime.now(tz=timezone.utc),  # run once at startup
+            "cron",
+            hour="7-10",
+            minute="*/25",
+            day_of_week="mon-fri",
+            timezone=_ET,
+            id="sentiment_job_early",
+        )
+        self._scheduler.add_job(
+            self.sentiment_job,
+            "cron",
+            hour="10-16",
+            minute="*/35",
+            day_of_week="mon-fri",
+            timezone=_ET,
+            id="sentiment_job_late",
         )
         self._scheduler.add_job(
             self.market_open_job,

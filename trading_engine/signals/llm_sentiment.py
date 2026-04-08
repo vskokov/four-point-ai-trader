@@ -30,6 +30,62 @@ from trading_engine.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _human_age(published_at: datetime, now: datetime | None = None) -> str:
+    """
+    Format the age of *published_at* as a human-readable bracket string.
+
+    Parameters
+    ----------
+    published_at:
+        UTC-aware publication datetime.
+    now:
+        Reference instant (UTC).  Defaults to ``datetime.now(tz=timezone.utc)``.
+        Pass a fixed value in tests for deterministic output.
+
+    Examples
+    --------
+    >>> _human_age(pub, now=pub + timedelta(minutes=23))
+    '[23 minutes ago]'
+    >>> _human_age(pub, now=pub + timedelta(hours=2, minutes=50))
+    '[2 hours 50 minutes ago]'
+    """
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+
+    delta = now - published_at
+    total_seconds = delta.total_seconds()
+
+    if total_seconds <= 0:
+        return "[just now]"
+
+    if total_seconds < 3600:                        # under 1 hour
+        m = int(total_seconds // 60)
+        unit = "minute" if m == 1 else "minutes"
+        return f"[{m} {unit} ago]"
+
+    if total_seconds < 86400:                       # 1 hour – 24 hours
+        h = int(total_seconds // 3600)
+        m = int((total_seconds % 3600) // 60)
+        h_str = "1 hour" if h == 1 else f"{h} hours"
+        if m == 0:
+            return f"[{h_str} ago]"
+        m_str = "1 minute" if m == 1 else f"{m} minutes"
+        return f"[{h_str} {m_str} ago]"
+
+    # 24+ hours
+    d = int(total_seconds // 86400)
+    h = int((total_seconds % 86400) // 3600)
+    d_str = "1 day" if d == 1 else f"{d} days"
+    if h == 0:
+        return f"[{d_str} ago]"
+    h_str = "1 hour" if h == 1 else f"{h} hours"
+    return f"[{d_str} {h_str} ago]"
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -74,7 +130,7 @@ class LLMSentimentSignal:
         self,
         model: str = settings.OLLAMA_MODEL,
         host: str = settings.OLLAMA_HOST,
-        hours_back: int = 8,
+        hours_back: int = 2,
         min_relevance: float = 0.3,
     ) -> None:
         self.model = model
@@ -125,7 +181,9 @@ class LLMSentimentSignal:
             title   = (h.get("title") or "").strip()
             summary = (h.get("summary") or "").strip()
             body    = f"{title}. {summary}" if summary else title
-            numbered.append(f"{i}. {body[:300]}")
+            pub     = h.get("published_at")
+            age_str = _human_age(pub) if pub is not None else "[unknown time]"
+            numbered.append(f"{i}. {age_str} {body[:300]}")
 
         headline_block = "\n".join(numbered)
 
@@ -135,6 +193,9 @@ class LLMSentimentSignal:
             f"Ticker: {ticker}\n\n"
             "News headlines (analyze ONLY these — ignore any prior knowledge "
             "about this company, its products, management, or financials):\n"
+            "Each headline is prefixed with its age (e.g. [2 hours 30 minutes ago]). "
+            "Weight recent headlines more heavily — news older than 6 hours may already "
+            "be priced in.\n"
             f"{headline_block}\n\n"
             "Return exactly this JSON object — no other text:\n"
             "{\n"
@@ -393,11 +454,20 @@ class LLMSentimentSignal:
         """
         results: list[dict[str, Any]] = []
 
+        # 1. Single AV call for all tickers — 1 API call per pipeline run.
+        all_articles: list[dict[str, Any]] = av_client.fetch_news(
+            tickers, hours_back=self.hours_back
+        )
+
+        # Group articles by ticker (each article dict has a "ticker" field).
+        articles_by_ticker: dict[str, list[dict[str, Any]]] = {t: [] for t in tickers}
+        for _art in all_articles:
+            t = _art.get("ticker", "")
+            if t in articles_by_ticker:
+                articles_by_ticker[t].append(_art)
+
         for ticker in tickers:
-            # 1. Fetch
-            articles: list[dict[str, Any]] = av_client.fetch_news(
-                [ticker], hours_back=self.hours_back
-            )
+            articles = articles_by_ticker.get(ticker, [])
             n_fetched = len(articles)
 
             # 2. Deduplicate against in-process cache
@@ -491,6 +561,12 @@ class LLMSentimentSignal:
     ) -> list[dict[str, Any]] | None:
         """
         Call ``run_pipeline`` only during NYSE hours ± *pre_post_minutes*.
+
+        .. deprecated::
+            Market-hours gating is now handled by APScheduler cron triggers in
+            ``TradingEngine.run()``.  The two cron windows (07:00–10:29 ET every
+            25 min, 10:30–16:30 ET every 35 min) replace the need for this guard.
+            This method is retained for backward compatibility with existing tests.
 
         The extended window is:
             (09:30 − pre_post_minutes) ET  to  (16:00 + pre_post_minutes) ET

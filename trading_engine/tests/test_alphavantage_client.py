@@ -201,7 +201,7 @@ class TestFetchNewsHappyPath:
         params = kwargs["params"]
         assert params["function"] == "NEWS_SENTIMENT"
         assert params["tickers"] == "AAPL,MSFT"
-        assert params["limit"] == "50"
+        assert params["limit"] == "200"
         assert params["apikey"] == "fake-av-key"
         # time_from should be a YYYYMMDDTHHMM string
         assert len(params["time_from"]) == 13
@@ -456,3 +456,130 @@ class TestIsMarketHours:
         self._mock_now_et(monkeypatch, weekday=6, hour=11, minute=0)   # Sun 11:00 ET
         client = _make_client(tmp_path, monkeypatch)
         assert client.is_market_hours() is False
+
+
+# ---------------------------------------------------------------------------
+# Per-minute rate guard
+# ---------------------------------------------------------------------------
+
+class TestPerMinuteRateGuard:
+    """Tests for _enforce_per_minute_limit (uses mocked time.monotonic / time.sleep)."""
+
+    def _make_mock_time(self, monotonic_value: float = 0.0) -> MagicMock:
+        mock_time = MagicMock()
+        mock_time.monotonic.return_value = monotonic_value
+        mock_time.sleep = MagicMock()
+        return mock_time
+
+    def test_five_rapid_calls_no_sleep(self, tmp_path, monkeypatch):
+        """First 5 calls within the same instant must not trigger sleep."""
+        mock_time = self._make_mock_time(0.0)
+        monkeypatch.setattr(f"{_MOD}.time", mock_time)
+        client = _make_client(tmp_path, monkeypatch)
+
+        for _ in range(5):
+            client._enforce_per_minute_limit()
+
+        mock_time.sleep.assert_not_called()
+
+    def test_sixth_rapid_call_triggers_sleep(self, tmp_path, monkeypatch):
+        """6th call within the same 60-second window must trigger time.sleep."""
+        mock_time = self._make_mock_time(0.0)
+        monkeypatch.setattr(f"{_MOD}.time", mock_time)
+        client = _make_client(tmp_path, monkeypatch)
+
+        for _ in range(5):
+            client._enforce_per_minute_limit()
+
+        # 6th call: 5 entries at t=0.0 → sleep for 60 seconds
+        client._enforce_per_minute_limit()
+
+        mock_time.sleep.assert_called_once()
+        sleep_arg = mock_time.sleep.call_args[0][0]
+        assert sleep_arg == pytest.approx(60.0)
+
+    def test_call_after_60_seconds_no_sleep(self, tmp_path, monkeypatch):
+        """After 60 seconds the old entries are pruned; 6th call must not sleep."""
+        # First 5 calls at t=0; 6th call at t=61 (past the 60-second window)
+        times = [0.0, 0.0, 0.0, 0.0, 0.0, 61.0, 61.0]
+        idx = [0]
+
+        mock_time = MagicMock()
+        mock_time.sleep = MagicMock()
+
+        def fake_monotonic():
+            val = times[min(idx[0], len(times) - 1)]
+            idx[0] += 1
+            return val
+
+        mock_time.monotonic.side_effect = fake_monotonic
+        monkeypatch.setattr(f"{_MOD}.time", mock_time)
+
+        client = _make_client(tmp_path, monkeypatch)
+        for _ in range(5):
+            client._enforce_per_minute_limit()
+
+        # 6th call at t=61: entries at t=0 are pruned (61-0=61 >= 60)
+        client._enforce_per_minute_limit()
+
+        mock_time.sleep.assert_not_called()
+
+    def test_recent_call_times_pruned_after_window(self, tmp_path, monkeypatch):
+        """After pruning, _recent_call_times must contain only in-window entries."""
+        times = [0.0] * 3 + [65.0]
+        idx = [0]
+
+        mock_time = MagicMock()
+        mock_time.sleep = MagicMock()
+
+        def fake_monotonic():
+            val = times[min(idx[0], len(times) - 1)]
+            idx[0] += 1
+            return val
+
+        mock_time.monotonic.side_effect = fake_monotonic
+        monkeypatch.setattr(f"{_MOD}.time", mock_time)
+
+        client = _make_client(tmp_path, monkeypatch)
+        for _ in range(3):
+            client._enforce_per_minute_limit()  # t=0 each
+
+        # At t=65 the 3 entries at t=0 are outside the 60-second window
+        client._enforce_per_minute_limit()
+
+        # Only the entry for t=65 should remain
+        assert len(client._recent_call_times) == 1
+
+
+# ---------------------------------------------------------------------------
+# get_daily_call_count
+# ---------------------------------------------------------------------------
+
+class TestGetDailyCallCount:
+
+    def test_returns_zero_when_no_state_file(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path, monkeypatch)
+        assert client.get_daily_call_count() == 0
+
+    def test_returns_correct_count_after_calls(self, tmp_path, monkeypatch):
+        client = _make_client(tmp_path, monkeypatch)
+        with patch(f"{_MOD}.requests.get", return_value=_mock_response(_AV_EMPTY_FEED)):
+            client.fetch_news(["AAPL"])
+            client.fetch_news(["AAPL"])
+        assert client.get_daily_call_count() == 2
+
+    def test_returns_zero_for_stale_date(self, tmp_path, monkeypatch):
+        """A state file from a past date must be treated as zero for today."""
+        state_file = tmp_path / "av_rate_state.json"
+        state_file.write_text(json.dumps({"date": "2000-01-01", "count": 15}))
+        client = _make_client(tmp_path, monkeypatch)
+        assert client.get_daily_call_count() == 0
+
+    def test_returns_correct_count_from_preloaded_state(self, tmp_path, monkeypatch):
+        """If today's state is pre-seeded, count is read correctly."""
+        state_file = tmp_path / "av_rate_state.json"
+        state_file.write_text(
+            json.dumps({"date": date.today().isoformat(), "count": 7})
+        )
+        client = _make_client(tmp_path, monkeypatch)
+        assert client.get_daily_call_count() == 7

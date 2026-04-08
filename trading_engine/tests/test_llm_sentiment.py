@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, call, patch
 
@@ -108,6 +108,67 @@ class _FakeStorage:
 
 
 # ---------------------------------------------------------------------------
+# Tests — _human_age
+# ---------------------------------------------------------------------------
+
+class TestHumanAge:
+    """All tests use a fixed ``now`` for deterministic output."""
+
+    # Reference point — arbitrary UTC instant
+    _NOW = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _pub(self, **delta_kwargs) -> datetime:
+        """Return a published_at by subtracting a timedelta from _NOW."""
+        return self._NOW - timedelta(**delta_kwargs)
+
+    def test_zero_seconds_is_just_now(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._NOW, now=self._NOW) == "[just now]"
+
+    def test_negative_delta_is_just_now(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        future = self._NOW + timedelta(seconds=10)
+        assert _human_age(future, now=self._NOW) == "[just now]"
+
+    def test_one_minute_singular(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(minutes=1), now=self._NOW) == "[1 minute ago]"
+
+    def test_twenty_three_minutes(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(minutes=23), now=self._NOW) == "[23 minutes ago]"
+
+    def test_sixty_minutes_is_one_hour_no_minutes(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(minutes=60), now=self._NOW) == "[1 hour ago]"
+
+    def test_two_hours_fifty_minutes(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        result = _human_age(self._pub(hours=2, minutes=50), now=self._NOW)
+        assert result == "[2 hours 50 minutes ago]"
+
+    def test_twenty_four_hours_is_one_day_no_hours(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(hours=24), now=self._NOW) == "[1 day ago]"
+
+    def test_twenty_five_hours_is_one_day_one_hour(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(hours=25), now=self._NOW) == "[1 day 1 hour ago]"
+
+    def test_forty_eight_hours_is_two_days_no_hours(self):
+        from trading_engine.signals.llm_sentiment import _human_age
+        assert _human_age(self._pub(hours=48), now=self._NOW) == "[2 days ago]"
+
+    def test_default_now_returns_string(self):
+        """Without a fixed now, the function should still return a valid string."""
+        from trading_engine.signals.llm_sentiment import _human_age
+        pub = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        result = _human_age(pub)
+        assert result.startswith("[")
+        assert result.endswith(" ago]")
+
+
+# ---------------------------------------------------------------------------
 # Tests — _build_prompt
 # ---------------------------------------------------------------------------
 
@@ -127,10 +188,20 @@ class TestBuildPrompt:
         articles = [_make_article()]
         articles[0]["summary"] = long_summary
         prompt = sig._build_prompt("AAPL", articles)
-        # Each headline body is capped at 300 chars
+        # Each headline body (after the age prefix) is capped at 300 chars.
         for line in prompt.splitlines():
-            stripped = line.lstrip("0123456789. ")
-            assert len(stripped) <= 300, f"Line exceeds 300 chars: {stripped[:40]}…"
+            if not line or not line[0].isdigit():
+                continue
+            # Strip leading "N. " number prefix
+            without_num = line.lstrip("0123456789. ")
+            # Strip age bracket "[... ago] " if present
+            if without_num.startswith("["):
+                bracket_end = without_num.find("]")
+                if bracket_end != -1:
+                    without_num = without_num[bracket_end + 2:]  # skip "] "
+            assert len(without_num) <= 300, (
+                f"Body exceeds 300 chars: {without_num[:40]}…"
+            )
 
     def test_caps_at_max_headlines(self, sig: Any) -> None:
         # 60 articles — only top 50 by relevance should appear in the prompt.
@@ -161,13 +232,41 @@ class TestBuildPrompt:
             assert key in prompt
 
     def test_no_prices_in_prompt(self, sig: Any) -> None:
-        """The prompt must never instruct the LLM to consider price data."""
+        """The prompt must never instruct the LLM to consider OHLCV data.
+
+        Note: "priced in" (a financial idiom in the recency instruction) is
+        intentional and does not instruct the LLM to look at price data, so
+        "price" is excluded from the forbidden list here.
+        """
         articles = [_make_article()]
         prompt = sig._build_prompt("AAPL", articles)
-        forbidden = ("price", "ohlcv", "bar", "candle", "volume", "open", "close")
+        # "price" is not forbidden because "priced in" idiom is used legitimately
+        forbidden = ("ohlcv", "bar", "candle", "volume")
         lower = prompt.lower()
         for word in forbidden:
             assert word not in lower, f"Price-related term '{word}' found in prompt"
+
+    def test_build_prompt_includes_age_prefix(self, sig: Any) -> None:
+        """Each headline line must be prefixed with its age bracket."""
+        with patch(f"{_MOD}._human_age", return_value="[5 minutes ago]") as mock_age:
+            articles = [_make_article()]
+            prompt = sig._build_prompt("AAPL", articles)
+        assert "[5 minutes ago]" in prompt
+        mock_age.assert_called_once()
+
+    def test_build_prompt_includes_recency_instruction(self, sig: Any) -> None:
+        """The prompt must include the recency-weighting instruction sentence."""
+        articles = [_make_article()]
+        prompt = sig._build_prompt("AAPL", articles)
+        assert "Weight recent headlines" in prompt
+        assert "6 hours" in prompt
+
+    def test_build_prompt_fallback_for_missing_published_at(self, sig: Any) -> None:
+        """If an article lacks published_at, age falls back to [unknown time]."""
+        article = _make_article()
+        del article["published_at"]
+        prompt = sig._build_prompt("AAPL", [article])
+        assert "[unknown time]" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -482,15 +581,35 @@ class TestRunPipeline:
     def test_multiple_tickers_one_llm_call_each(self, sig: Any) -> None:
         _set_llm_response(sig, _VALID_LLM_RESPONSE)
         storage = _FakeStorage()
-        # Return distinct articles for each ticker so neither is deduplicated.
+        # Single fetch_news call returns articles for both tickers.
         av = MagicMock()
-        av.fetch_news.side_effect = [
-            [_make_article(title="AAPL headline", ticker="AAPL")],
-            [_make_article(title="MSFT headline", ticker="MSFT")],
+        av.fetch_news.return_value = [
+            _make_article(title="AAPL headline", ticker="AAPL"),
+            _make_article(title="MSFT headline", ticker="MSFT"),
         ]
         sig.run_pipeline(["AAPL", "MSFT"], av, storage)
-        # One LLM call per ticker (two distinct articles)
+        # fetch_news called exactly once for all tickers
+        av.fetch_news.assert_called_once_with(["AAPL", "MSFT"], hours_back=sig.hours_back)
+        # One LLM call per ticker (articles grouped by ticker, 1 article each)
         assert sig._client.chat.call_count == 2
+
+    def test_single_av_call_for_three_tickers(self, sig: Any) -> None:
+        """run_pipeline must call fetch_news exactly once regardless of ticker count."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [
+            _make_article(title="AAPL h", ticker="AAPL"),
+            _make_article(title="MSFT h", ticker="MSFT"),
+            _make_article(title="GOOG h", ticker="GOOG"),
+        ]
+        results = sig.run_pipeline(["AAPL", "MSFT", "GOOG"], av, storage)
+        # Exactly 1 AV API call
+        av.fetch_news.assert_called_once()
+        # All 3 tickers are scored → 3 signal rows
+        assert len(storage.signal_rows) == 3
+        returned_tickers = {r["ticker"] for r in results}
+        assert returned_tickers == {"AAPL", "MSFT", "GOOG"}
 
     def test_returns_list_of_result_dicts(self, sig: Any) -> None:
         _set_llm_response(sig, _VALID_LLM_RESPONSE)
@@ -557,8 +676,11 @@ class TestRunIfMarketHours:
 
     def test_calls_pipeline_during_market_hours(self, sig: Any) -> None:
         _set_llm_response(sig, _VALID_LLM_RESPONSE)
-        # 10:30 ET — inside the window
-        with patch(f"{_MOD}.datetime") as mock_dt:
+        # 10:30 ET — inside the window.
+        # Patch _human_age too so it doesn't try to do arithmetic with the
+        # MagicMock returned by the patched datetime.now.
+        with patch(f"{_MOD}.datetime") as mock_dt, \
+             patch(f"{_MOD}._human_age", return_value="[5 minutes ago]"):
             fake_now = MagicMock()
             fake_now.weekday.return_value = 1  # Tuesday
             fake_now.hour   = 10
