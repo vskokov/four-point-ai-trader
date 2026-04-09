@@ -287,7 +287,10 @@ class AlpacaMarketData:
             return df
 
         df = pd.DataFrame.from_dict(rows, orient="index")
-        df.index = pd.DatetimeIndex(df.index, tz="UTC", name="time")
+        idx = pd.DatetimeIndex(df.index, name="time")
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        df.index = idx
         df = df.sort_index().reindex(columns=tickers)
 
         logger.info(
