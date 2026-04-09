@@ -339,9 +339,45 @@ class TradingEngine:
         end = datetime.now(tz=timezone.utc)
         start = end - timedelta(days=int(252 * 1.4))   # generous fetch window
 
+        # Minimum raw rows needed: 20-bar burn-in + 30 HMM minimum + 10 buffer
+        _MIN_OHLCV_ROWS = 60
+
         for ticker in self._tickers:
             if not self._hmm[ticker].is_fitted:
                 logger.info("engine.startup_checks.hmm_fit", ticker=ticker)
+
+                # Seed DB with Alpaca history if not enough rows exist
+                try:
+                    existing = self._storage.query_ohlcv(ticker, start, end)
+                    if len(existing) < _MIN_OHLCV_ROWS:
+                        logger.info(
+                            "engine.startup_checks.seeding_history",
+                            ticker=ticker,
+                            rows_in_db=len(existing),
+                            needed=_MIN_OHLCV_ROWS,
+                        )
+                        seeded = self._alpaca.fetch_historical_ohlcv(
+                            [ticker], start, end, timeframe="1Day"
+                        )
+                        if seeded.empty:
+                            logger.warning(
+                                "engine.startup_checks.seed_no_data",
+                                ticker=ticker,
+                                hint="ticker may not be available on IEX feed",
+                            )
+                        else:
+                            logger.info(
+                                "engine.startup_checks.seeded",
+                                ticker=ticker,
+                                n_bars=len(seeded),
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "engine.startup_checks.seed_failed",
+                        ticker=ticker,
+                        error=str(exc),
+                    )
+
                 try:
                     self._hmm[ticker].fit(ticker, start, end, self._storage)
                     logger.info("engine.startup_checks.hmm_fitted", ticker=ticker)

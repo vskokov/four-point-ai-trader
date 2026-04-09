@@ -1206,3 +1206,157 @@ class TestMarketOpenJobRebalance:
 
         # No buy orders should have been submitted
         engine._executor._trading.submit_order.assert_not_called()
+
+
+# ===========================================================================
+# startup_checks — historical seeding
+# ===========================================================================
+
+class TestStartupChecksSeeding:
+    """
+    Tests for the DB-seeding path inside startup_checks.
+
+    startup_checks is tested via a real TradingEngine.__init__ call with all
+    external deps patched.  We call startup_checks() directly to exercise only
+    that method.
+    """
+
+    def _build_seeding_engine(self, tmp_path, hmm_fitted=False):
+        """Build a minimal engine with patched deps for startup_checks tests."""
+        from trading_engine.orchestrator.engine import TradingEngine
+
+        engine = TradingEngine.__new__(TradingEngine)
+
+        mock_storage = MagicMock()
+        mock_alpaca  = MagicMock()
+        mock_hmm     = MagicMock()
+        mock_hmm.is_fitted = hmm_fitted
+
+        engine._tickers        = ["AAPL"]
+        engine._pairs          = []
+        engine._storage        = mock_storage
+        engine._alpaca         = mock_alpaca
+        engine._hmm            = {"AAPL": mock_hmm}
+        engine._ou_signals     = {}
+        engine._llm            = MagicMock()
+        engine._mwu            = {"AAPL": MagicMock()}
+        engine._risk           = MagicMock()
+        engine._executor       = MagicMock()
+        engine._state_manager  = MagicMock()
+        engine._signal_stats   = {"AAPL": {}}
+        engine._shutdown_event = __import__("threading").Event()
+        engine._emergency_close = False
+        engine._scheduler      = None
+        engine._models_dir     = tmp_path
+        engine.portfolio_optimizer = MagicMock()
+
+        # Alpaca: account OK, Ollama: model found
+        mock_alpaca.get_account_info.return_value = _account()
+
+        return engine, mock_storage, mock_alpaca, mock_hmm
+
+    def test_seeds_when_db_has_too_few_rows(self, tmp_path):
+        """If DB has < 60 rows, fetch_historical_ohlcv should be called."""
+        engine, mock_storage, mock_alpaca, mock_hmm = self._build_seeding_engine(
+            tmp_path, hmm_fitted=False
+        )
+
+        # DB returns only 12 rows — not enough
+        mock_storage.query_ohlcv.return_value = pd.DataFrame({"close": range(12)})
+
+        # Alpaca returns a non-empty DataFrame with enough rows
+        seeded_df = pd.DataFrame({"ticker": ["AAPL"] * 100, "close": range(100)})
+        mock_alpaca.fetch_historical_ohlcv.return_value = seeded_df
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()
+
+        mock_alpaca.fetch_historical_ohlcv.assert_called_once()
+        call_args = mock_alpaca.fetch_historical_ohlcv.call_args
+        assert call_args[0][0] == ["AAPL"]
+        assert call_args[1]["timeframe"] == "1Day"
+
+    def test_no_seed_when_db_has_enough_rows(self, tmp_path):
+        """If DB already has ≥ 60 rows, fetch_historical_ohlcv is NOT called."""
+        engine, mock_storage, mock_alpaca, mock_hmm = self._build_seeding_engine(
+            tmp_path, hmm_fitted=False
+        )
+
+        # DB returns 100 rows — enough
+        mock_storage.query_ohlcv.return_value = pd.DataFrame({"close": range(100)})
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()
+
+        mock_alpaca.fetch_historical_ohlcv.assert_not_called()
+
+    def test_seed_failure_does_not_abort_fit(self, tmp_path):
+        """If seeding raises, the engine still attempts hmm.fit (and logs a warning)."""
+        engine, mock_storage, mock_alpaca, mock_hmm = self._build_seeding_engine(
+            tmp_path, hmm_fitted=False
+        )
+
+        mock_storage.query_ohlcv.return_value = pd.DataFrame({"close": range(12)})
+        mock_alpaca.fetch_historical_ohlcv.side_effect = RuntimeError("API down")
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()   # must not raise
+
+        # fit was still attempted despite seeding failure
+        mock_hmm.fit.assert_called_once()
+
+    def test_no_seeding_when_already_fitted(self, tmp_path):
+        """Seeding is skipped entirely when the HMM is already fitted."""
+        engine, mock_storage, mock_alpaca, mock_hmm = self._build_seeding_engine(
+            tmp_path, hmm_fitted=True
+        )
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()
+
+        mock_storage.query_ohlcv.assert_not_called()
+        mock_alpaca.fetch_historical_ohlcv.assert_not_called()
+
+    def test_seed_empty_response_logs_warning_and_continues(self, tmp_path):
+        """If Alpaca returns an empty DataFrame (ticker not on IEX), fit is still attempted."""
+        engine, mock_storage, mock_alpaca, mock_hmm = self._build_seeding_engine(
+            tmp_path, hmm_fitted=False
+        )
+
+        mock_storage.query_ohlcv.return_value = pd.DataFrame({"close": range(12)})
+        mock_alpaca.fetch_historical_ohlcv.return_value = pd.DataFrame()  # empty
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()   # must not raise
+
+        mock_hmm.fit.assert_called_once()
