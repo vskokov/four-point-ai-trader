@@ -39,7 +39,7 @@ from trading_engine.orchestrator.state_manager import StateManager
 from trading_engine.signals.hmm_regime import HMMRegimeDetector
 from trading_engine.signals.llm_sentiment import LLMSentimentSignal
 from trading_engine.signals.mean_reversion import OUSpreadSignal
-from trading_engine.utils.logging import get_logger
+from trading_engine.utils.logging import get_logger, regime_banner
 
 logger = get_logger(__name__)
 
@@ -502,6 +502,7 @@ class TradingEngine:
                 direction = _REGIME_TO_SIGNAL.get(label, 0)
                 confidence = float(max(regime_result["probs"]))
                 hmm_signal = {"signal": direction, "confidence": confidence}
+                logger.info(regime_banner(label, ticker))
             except Exception as exc:
                 logger.warning(
                     "engine.hmm_predict_failed", ticker=ticker, error=str(exc)

@@ -1,10 +1,42 @@
 """Structlog configuration with JSON file output and console stdout output."""
 
 import logging
+import re
 import sys
 from typing import Any
 
 import structlog
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Regime display: color + symbol prefix
+REGIME_FMT: dict[str, str] = {
+    "bear":    "\033[91m",   # bright red
+    "neutral": "\033[93m",   # bright yellow
+    "bull":    "\033[92m",   # bright green
+}
+_RESET = "\033[0m"
+
+
+def regime_banner(label: str, ticker: str) -> str:
+    """Return an ANSI-colored regime banner string for console logging."""
+    color = REGIME_FMT.get(label.lower(), "")
+    symbol = {"bear": "▼", "neutral": "◆", "bull": "▲"}.get(label.lower(), "●")
+    return f"{color}{symbol} REGIME [{ticker}]: {label.upper()}{_RESET}"
+
+
+def _strip_ansi(
+    logger: Any, method: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Structlog processor — remove ANSI escape codes from all string values."""
+    for key, val in event_dict.items():
+        if isinstance(val, str):
+            event_dict[key] = _ANSI_RE.sub("", val)
+    return event_dict
 
 
 def configure_logging(log_level: str = "INFO", log_file: str | None = None) -> None:
@@ -56,6 +88,7 @@ def configure_logging(log_level: str = "INFO", log_file: str | None = None) -> N
             structlog.stdlib.ProcessorFormatter(
                 processors=[
                     structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                    _strip_ansi,
                     structlog.processors.JSONRenderer(),
                 ]
             )
