@@ -43,6 +43,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 | **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
 | **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes |
 | **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
+| **Dashboard** | Standalone Streamlit app (`dashboard/app.py`); displays last 25/50/100 trades with HMM regime probabilities, OU spread details, LLM sentiment, MWU weights, and collapsible news headlines; auto-refreshes every 60 s |
 
 ---
 
@@ -79,10 +80,12 @@ trading_engine/
 │   └── portfolio_optimizer.py   # PortfolioOptimizer (Black-Litterman + Min-Variance)
 ├── tools/
 │   └── pair_scanner.py          # Standalone pair discovery CLI (run weekly)
+├── dashboard/
+│   └── app.py                   # Streamlit trade decision dashboard
 ├── models/                      # Auto-created; HMM .pkl, Kalman .pkl, MWU .npy
 ├── utils/
-│   └── logging.py               # structlog factory (JSON file + console)
-├── tests/                       # 409 unit tests — no live connections required
+│   └── logging.py               # structlog factory (JSON file + console; colored regime banner)
+├── tests/                       # 414 unit tests — no live connections required
 │   ├── tools/
 │   │   └── test_pair_scanner.py
 │   └── ...
@@ -127,6 +130,7 @@ New bar arrives
       ├── if 0 → no-op
       │
       └── if ±1 →
+            Storage.insert_trade_log()   ← full decision snapshot to DB
             AlpacaMarketData.is_market_open()  ← Alpaca clock API, 60 s cache
               └── if closed → skip order (bar still fully processed)
             RiskManager.check_trade()
@@ -284,6 +288,18 @@ options:
 Shutdown cleanly with `Ctrl-C` or `SIGTERM`. If the circuit breaker fires, all
 positions are liquidated before exit.
 
+### Step 3 — Run the dashboard (optional)
+
+In a separate terminal, start the Streamlit decision-audit dashboard:
+
+```bash
+cd trading_engine
+.venv/bin/streamlit run dashboard/app.py
+```
+
+Open `http://localhost:8501`. Shows the last 25/50/100 trades with full
+signal breakdown and contributing news headlines. Auto-refreshes every 60 s.
+
 ---
 
 ## Risk controls
@@ -310,7 +326,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 409 tests, no live connections required
+# Unit tests — 414 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -338,11 +354,11 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
 | `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 65 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate |
+| `test_engine.py` | 70 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **409** | |
+| **Total (unit)** | **414** | |
 
 ---
 
@@ -358,7 +374,15 @@ EOD job and on clean shutdown:
 
 HMM models, Kalman filters, and MWU weights are persisted by their own modules
 (`models/hmm_{ticker}.pkl`, `models/kalman_{t1}_{t2}.pkl`,
-`models/mwu_weights.npy`).
+`models/mwu_weights_{ticker}.npy` — one file per ticker).
+
+To force a clean restart (refit all models from scratch):
+
+```bash
+rm trading_engine/models/hmm_*.pkl
+rm trading_engine/models/mwu_weights_*.npy
+rm trading_engine/models/engine_state.json*
+```
 
 ---
 
@@ -390,6 +414,7 @@ is also at 20.
 | 7 — Pair discovery | Standalone cointegration scanner, JSON-driven pair loading | Complete |
 | 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe | Complete |
 | 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate | Complete |
+| 10 — Observability | Trade decision dashboard (Streamlit); colored regime banner in logs; `trade_log` DB table; contributing headlines persisted; per-ticker MWU weight files; HMM history seeding at startup | Complete |
 
 ---
 
