@@ -420,13 +420,18 @@ class TradingEngine:
             return {"signal": 0, "confidence": 0.0}
 
         if row is None:
-            return {"signal": 0, "confidence": 0.0}
+            return {"signal": 0, "confidence": 0.0, "contributing_headlines": []}
 
         value = float(row[0])
         meta: dict[str, Any] = json.loads(row[1]) if row[1] else {}
         direction = int(meta.get("direction", 0))
         confidence = float(meta.get("confidence", abs(value)))
-        return {"signal": direction, "confidence": min(confidence, 1.0)}
+        headlines: list[dict[str, Any]] = meta.get("contributing_headlines", [])
+        return {
+            "signal":                  direction,
+            "confidence":              min(confidence, 1.0),
+            "contributing_headlines":  headlines,
+        }
 
     def _get_ou_signal_for_ticker(self, ticker: str) -> dict[str, Any]:
         """
@@ -443,12 +448,16 @@ class TradingEngine:
                 df2 = self._storage.query_ohlcv(pair[1], start, end)
                 min_rows = max(ou.lookback, 10)
                 if len(df1) < min_rows or len(df2) < min_rows:
-                    return {"signal": 0, "confidence": 0.0}
+                    return {"signal": 0, "confidence": 0.0, "z_score": None,
+                            "spread_value": None, "pair": f"{pair[0]}/{pair[1]}"}
                 result = ou.compute_signal(df1, df2, storage=self._storage)
                 z = result["z_score"]
                 return {
-                    "signal": result["signal"],
-                    "confidence": min(abs(z) / 3.0, 1.0),
+                    "signal":       result["signal"],
+                    "confidence":   min(abs(z) / 3.0, 1.0),
+                    "z_score":      z,
+                    "spread_value": result.get("spread"),
+                    "pair":         f"{pair[0]}/{pair[1]}",
                 }
             except Exception as exc:
                 logger.warning(
@@ -457,8 +466,10 @@ class TradingEngine:
                     pair=pair,
                     error=str(exc),
                 )
-                return {"signal": 0, "confidence": 0.0}
-        return {"signal": 0, "confidence": 0.0}
+                return {"signal": 0, "confidence": 0.0, "z_score": None,
+                        "spread_value": None, "pair": f"{pair[0]}/{pair[1]}"}
+        return {"signal": 0, "confidence": 0.0, "z_score": None,
+                "spread_value": None, "pair": None}
 
     # ------------------------------------------------------------------
     # Bar handler
@@ -493,6 +504,8 @@ class TradingEngine:
 
         hmm_signal: dict[str, Any] = {"signal": 0, "confidence": 0.0}
         regime = 1   # default neutral
+        regime_label = "neutral"
+        regime_probs: dict[str, float] = {}
 
         if hmm.is_fitted:
             try:
@@ -500,8 +513,16 @@ class TradingEngine:
                 regime = regime_result["regime"]
                 label = regime_result["label"]
                 direction = _REGIME_TO_SIGNAL.get(label, 0)
-                confidence = float(max(regime_result["probs"]))
+                probs = regime_result["probs"]
+                confidence = float(max(probs))
                 hmm_signal = {"signal": direction, "confidence": confidence}
+                regime_label = label
+                # Map prob list to named dict using state_labels from the HMM
+                state_labels = hmm.state_labels  # {state_idx: label_str}
+                regime_probs = {
+                    state_labels.get(i, str(i)): float(p)
+                    for i, p in enumerate(probs)
+                }
                 logger.info(regime_banner(label, ticker))
             except Exception as exc:
                 logger.warning(
@@ -530,8 +551,34 @@ class TradingEngine:
 
         final_signal: int = decision["final_signal"]
 
-        # 6. Order submission
+        # 6. Order submission + trade log
         if final_signal != 0:
+            # Always persist the decision so the dashboard shows it even when
+            # the market is closed or the order is rejected.
+            try:
+                self._storage.insert_trade_log({
+                    "time":                   datetime.now(tz=timezone.utc),
+                    "ticker":                 ticker,
+                    "final_signal":           final_signal,
+                    "score":                  decision["score"],
+                    "regime":                 regime,
+                    "regime_label":           regime_label,
+                    "regime_probs":           regime_probs,
+                    "hmm_signal":             int(hmm_signal["signal"]),
+                    "hmm_confidence":         float(hmm_signal["confidence"]),
+                    "ou_signal":              int(ou_signal.get("signal", 0)),
+                    "ou_confidence":          float(ou_signal.get("confidence", 0.0)),
+                    "ou_zscore":              ou_signal.get("z_score"),
+                    "ou_spread_value":        ou_signal.get("spread_value"),
+                    "ou_pair":                ou_signal.get("pair"),
+                    "llm_signal":             int(llm_signal.get("signal", 0)),
+                    "llm_confidence":         float(llm_signal.get("confidence", 0.0)),
+                    "mwu_weights":            decision.get("weights"),
+                    "contributing_headlines": llm_signal.get("contributing_headlines", []),
+                })
+            except Exception as exc:
+                logger.warning("engine.trade_log_failed", ticker=ticker, error=str(exc))
+
             if not self._alpaca.is_market_open():
                 logger.debug(
                     "engine.bar_handler.order_skipped_market_closed", ticker=ticker

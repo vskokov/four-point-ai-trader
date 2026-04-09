@@ -18,3 +18,5 @@ PyPortfolioOpt
 ollama
 apscheduler
 pytest
+streamlit
+streamlit-autorefresh

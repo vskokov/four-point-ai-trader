@@ -82,6 +82,30 @@ _DDL_REGIME_LOG_HYPERTABLE = """
 SELECT create_hypertable('regime_log', 'time', if_not_exists => TRUE);
 """
 
+_DDL_TRADE_LOG = """
+CREATE TABLE IF NOT EXISTS trade_log (
+    id                      BIGSERIAL    PRIMARY KEY,
+    time                    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    ticker                  TEXT         NOT NULL,
+    final_signal            INT          NOT NULL,
+    score                   FLOAT,
+    regime                  INT,
+    regime_label            TEXT,
+    regime_probs            JSONB,
+    hmm_signal              INT,
+    hmm_confidence          FLOAT,
+    ou_signal               INT,
+    ou_confidence           FLOAT,
+    ou_zscore               FLOAT,
+    ou_spread_value         FLOAT,
+    ou_pair                 TEXT,
+    llm_signal              INT,
+    llm_confidence          FLOAT,
+    mwu_weights             JSONB,
+    contributing_headlines  JSONB
+);
+"""
+
 
 # ---------------------------------------------------------------------------
 # Engine factory
@@ -132,6 +156,7 @@ class Storage:
             conn.execute(text(_DDL_SIGNAL_LOG_HYPERTABLE))
             conn.execute(text(_DDL_REGIME_LOG))
             conn.execute(text(_DDL_REGIME_LOG_HYPERTABLE))
+            conn.execute(text(_DDL_TRADE_LOG))
         logger.info("storage.bootstrap", status="done")
 
     # ------------------------------------------------------------------
@@ -371,6 +396,80 @@ class Storage:
             conn.execute(stmt, prepared)
         logger.info("storage.insert_regime", count=len(rows))
         return len(rows)
+
+    # ------------------------------------------------------------------
+    # Trade log
+    # ------------------------------------------------------------------
+
+    def insert_trade_log(self, row: dict[str, Any]) -> None:
+        """
+        Persist one trade decision to ``trade_log``.
+
+        Parameters
+        ----------
+        row:
+            Dict with keys matching the ``trade_log`` columns.
+            JSONB fields (regime_probs, mwu_weights, contributing_headlines)
+            may be passed as Python dicts/lists — they are serialised here.
+        """
+        r = dict(row)
+        for jsonb_col in ("regime_probs", "mwu_weights", "contributing_headlines"):
+            val = r.get(jsonb_col)
+            r[jsonb_col] = json.dumps(val, default=str) if val is not None else None
+
+        stmt = text(
+            """
+            INSERT INTO trade_log (
+                time, ticker, final_signal, score,
+                regime, regime_label, regime_probs,
+                hmm_signal, hmm_confidence,
+                ou_signal, ou_confidence, ou_zscore, ou_spread_value, ou_pair,
+                llm_signal, llm_confidence,
+                mwu_weights, contributing_headlines
+            ) VALUES (
+                :time, :ticker, :final_signal, :score,
+                :regime, :regime_label, :regime_probs,
+                :hmm_signal, :hmm_confidence,
+                :ou_signal, :ou_confidence, :ou_zscore, :ou_spread_value, :ou_pair,
+                :llm_signal, :llm_confidence,
+                :mwu_weights, :contributing_headlines
+            )
+            """
+        )
+        with self._engine.begin() as conn:
+            conn.execute(stmt, r)
+        logger.info(
+            "storage.insert_trade_log",
+            ticker=r.get("ticker"),
+            final_signal=r.get("final_signal"),
+        )
+
+    def query_trade_log(self, limit: int = 50) -> pd.DataFrame:
+        """
+        Return the most recent *limit* trade decisions, newest first.
+
+        Returns
+        -------
+        pd.DataFrame
+            All columns of ``trade_log``, sorted by ``time`` DESC.
+        """
+        stmt = text(
+            """
+            SELECT id, time, ticker, final_signal, score,
+                   regime, regime_label, regime_probs,
+                   hmm_signal, hmm_confidence,
+                   ou_signal, ou_confidence, ou_zscore, ou_spread_value, ou_pair,
+                   llm_signal, llm_confidence,
+                   mwu_weights, contributing_headlines
+            FROM   trade_log
+            ORDER  BY time DESC
+            LIMIT  :limit
+            """
+        )
+        with self._engine.connect() as conn:
+            result = conn.execute(stmt, {"limit": limit})
+            df = pd.DataFrame(result.fetchall(), columns=result.keys())
+        return df
 
     # ------------------------------------------------------------------
     # Lifecycle

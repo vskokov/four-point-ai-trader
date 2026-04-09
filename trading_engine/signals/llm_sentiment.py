@@ -518,6 +518,21 @@ class LLMSentimentSignal:
                     self._seen_hashes.add(h)
 
             # 5. Signal log: signed confidence = direction × confidence
+            # Store a condensed snapshot of contributing headlines so the
+            # dashboard can display them alongside each trade decision.
+            condensed_headlines = [
+                {
+                    "title":              a.get("title", ""),
+                    "source":             a.get("source"),
+                    "published_at":       a["published_at"].isoformat()
+                                          if hasattr(a.get("published_at"), "isoformat")
+                                          else str(a.get("published_at", "")),
+                    "av_sentiment_label": a.get("av_sentiment_label", ""),
+                    "av_sentiment_score": a.get("av_sentiment_score"),
+                    "relevance_score":    a.get("relevance_score"),
+                }
+                for a in new_articles
+            ]
             timestamp = datetime.now(tz=timezone.utc)
             storage.insert_signal([
                 {
@@ -526,11 +541,12 @@ class LLMSentimentSignal:
                     "signal_name": "llm_sentiment",
                     "value":       float(direction) * confidence,
                     "metadata": {
-                        "direction":   direction,
-                        "confidence":  confidence,
-                        "horizon":     score_result.get("horizon", "8h"),
-                        "n_headlines": score_result.get("n_headlines_used", 0),
-                        "source":      score_result.get("source", "llm"),
+                        "direction":              direction,
+                        "confidence":             confidence,
+                        "horizon":                score_result.get("horizon", "8h"),
+                        "n_headlines":            score_result.get("n_headlines_used", 0),
+                        "source":                 score_result.get("source", "llm"),
+                        "contributing_headlines": condensed_headlines,
                     },
                 }
             ])
