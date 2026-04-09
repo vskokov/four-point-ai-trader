@@ -200,7 +200,7 @@ class TradingEngine:
         }
         self._llm = LLMSentimentSignal()
         self._mwu: dict[str, MWUMetaAgent] = {
-            t: MWUMetaAgent(models_dir=self._models_dir)
+            t: MWUMetaAgent(ticker=t, models_dir=self._models_dir)
             for t in self._tickers
         }
 

@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 # Default models directory — resolved relative to this source file so it works
 # regardless of where the process is launched from.
 _MODELS_DIR = Path(__file__).parent.parent / "models"
-_WEIGHTS_FILENAME = "mwu_weights.npy"
+_WEIGHTS_FILENAME_TEMPLATE = "mwu_weights_{ticker}.npy"
 
 # Canonical signal names — order defines column indices in the weight matrix.
 _SIGNAL_NAMES: list[str] = ["hmm_regime", "ou_spread", "llm_sentiment"]
@@ -61,12 +61,14 @@ class MWUMetaAgent:
 
     def __init__(
         self,
+        ticker: str = "default",
         eta: float = 0.1,
         n_signals: int = 3,
         n_regimes: int = 3,
         min_confidence: float = 0.3,
         models_dir: Path | str | None = None,
     ) -> None:
+        self.ticker = ticker
         self.eta = eta
         self.n_signals = n_signals
         self.n_regimes = n_regimes
@@ -98,7 +100,7 @@ class MWUMetaAgent:
     # ------------------------------------------------------------------
 
     def _weights_path(self) -> Path:
-        return self._models_dir / _WEIGHTS_FILENAME
+        return self._models_dir / _WEIGHTS_FILENAME_TEMPLATE.format(ticker=self.ticker)
 
     def _load_weights(self) -> None:
         """Load persisted weight matrix if it exists."""

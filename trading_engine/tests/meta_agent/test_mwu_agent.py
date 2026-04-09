@@ -24,9 +24,9 @@ from trading_engine.meta_agent.mwu_agent import MWUMetaAgent
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_agent(tmp_path: Path, **kwargs: Any) -> MWUMetaAgent:
+def _make_agent(tmp_path: Path, ticker: str = "AAPL", **kwargs: Any) -> MWUMetaAgent:
     """Return a fresh MWUMetaAgent using tmp_path as the models directory."""
-    return MWUMetaAgent(models_dir=tmp_path, **kwargs)
+    return MWUMetaAgent(ticker=ticker, models_dir=tmp_path, **kwargs)
 
 
 def _bull_signals(conf: float = 1.0) -> dict[str, dict[str, Any]]:
@@ -83,16 +83,16 @@ class TestInit:
         assert agent.eta == 0.5
 
     def test_loads_persisted_weights(self, tmp_path: Path) -> None:
-        """If mwu_weights.npy exists, it is loaded instead of uniform init."""
+        """If mwu_weights_AAPL.npy exists, it is loaded instead of uniform init."""
         saved = np.array([[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.2, 0.3, 0.5]])
-        np.save(str(tmp_path / "mwu_weights.npy"), saved)
+        np.save(str(tmp_path / "mwu_weights_AAPL.npy"), saved)
         agent = _make_agent(tmp_path)
         np.testing.assert_allclose(agent.weights, saved)
 
     def test_ignores_wrong_shape_file(self, tmp_path: Path) -> None:
         """A persisted file with wrong shape is ignored; uniform init is used."""
         bad = np.ones((2, 5))
-        np.save(str(tmp_path / "mwu_weights.npy"), bad)
+        np.save(str(tmp_path / "mwu_weights_AAPL.npy"), bad)
         agent = _make_agent(tmp_path)
         expected = np.full((3, 3), 1.0 / 3)
         np.testing.assert_allclose(agent.weights, expected)
@@ -339,7 +339,7 @@ class TestWeightPersistence:
     def test_weights_persisted_after_update(self, tmp_path: Path) -> None:
         agent = _make_agent(tmp_path)
         agent.update_weights("AAPL", _bull_signals(), regime_t=0, actual_direction=1)
-        weights_file = tmp_path / "mwu_weights.npy"
+        weights_file = tmp_path / "mwu_weights_AAPL.npy"
         assert weights_file.exists()
 
     def test_saved_weights_loadable_by_new_instance(self, tmp_path: Path) -> None:
