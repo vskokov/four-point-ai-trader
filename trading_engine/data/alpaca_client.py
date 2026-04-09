@@ -23,6 +23,7 @@ from typing import Any
 import pandas as pd
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical.news import NewsClient
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
 from alpaca.data.requests import (
@@ -124,7 +125,7 @@ class AlpacaMarketData:
         self._stream = StockDataStream(
             api_key=settings.ALPACA_API_KEY,
             secret_key=settings.ALPACA_SECRET_KEY,
-            feed="iex",   # free-tier accounts cannot access SIP feed
+            feed=DataFeed.IEX,   # free-tier accounts cannot access SIP feed
         )
         self._trading = TradingClient(
             api_key=settings.ALPACA_API_KEY,
