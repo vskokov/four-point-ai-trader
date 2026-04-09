@@ -41,7 +41,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 | **Backtesting** | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results |
 | **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys) |
 | **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 %); peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
-| **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions` |
+| **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes |
 | **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
 
 ---
@@ -127,6 +127,8 @@ New bar arrives
       ├── if 0 → no-op
       │
       └── if ±1 →
+            AlpacaMarketData.is_market_open()  ← Alpaca clock API, 60 s cache
+              └── if closed → skip order (bar still fully processed)
             RiskManager.check_trade()
               ├── circuit breaker (drawdown / daily loss)
               └── position size limit
@@ -296,7 +298,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 392 tests, no live connections required
+# Unit tests — 401 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -316,19 +318,19 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 
 | Test file | Tests | Scope |
 |---|---|---|
-| `test_alpaca_client.py` | 20 | Alpaca data + news clients |
+| `test_alpaca_client.py` | 25 | Alpaca data + news clients; `is_market_open` cache |
 | `test_alphavantage_client.py` | 30 | Alpha Vantage news + rate limiting |
 | `test_hmm_regime.py` | 28 | HMM fit, predict, online update, persistence |
 | `test_mean_reversion.py` | 36 | Cointegration, OU params, Kalman hedge ratio |
 | `test_llm_sentiment.py` | 50 | LLM prompt, parse, retry, pipeline |
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
-| `test_executor.py` | 41 | RiskManager, Kelly sizing, OrderExecutor |
-| `test_engine.py` | 59 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading |
+| `test_executor.py` | 43 | RiskManager, Kelly sizing, OrderExecutor; market-closed guard |
+| `test_engine.py` | 62 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; market-closed guard |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **392** | |
+| **Total (unit)** | **401** | |
 
 ---
 
@@ -374,6 +376,7 @@ is also at 20.
 | 5 — Execution | Fractional Kelly sizing, risk controls, order routing, orchestration | Complete |
 | 6 — Portfolio | Black-Litterman + Min-Variance optimisation, daily rebalance | Complete |
 | 7 — Pair discovery | Standalone cointegration scanner, JSON-driven pair loading | Complete |
+| 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe | Complete |
 
 ---
 

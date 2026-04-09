@@ -411,6 +411,32 @@ class TestSubmitOrder:
 
         assert r_full["qty"] == r_half["qty"] * 2
 
+    def test_returns_skipped_when_market_closed(self):
+        """submit_order must short-circuit with status=skipped when market is closed."""
+        mock_trading = MagicMock()
+        mock_alpaca = self._make_mock_alpaca()
+        mock_alpaca.is_market_open.return_value = False
+        executor = _make_executor(mock_trading, mock_alpaca)
+
+        result = executor.submit_order("AAPL", 1, 0.8, _account(), _signal_stats())
+
+        assert result == {"status": "skipped", "reason": "market_closed"}
+        mock_trading.submit_order.assert_not_called()
+
+    def test_proceeds_when_market_open(self):
+        """submit_order must proceed normally when is_market_open() is True."""
+        mock_trading = MagicMock()
+        mock_trading.get_all_positions.return_value = []
+        mock_trading.submit_order.return_value = _fake_order()
+        mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
+        mock_alpaca.is_market_open.return_value = True
+        executor = _make_executor(mock_trading, mock_alpaca)
+
+        result = executor.submit_order("AAPL", 1, 1.0, _account(100_000), _signal_stats())
+
+        assert result["status"] == "submitted"
+        mock_trading.submit_order.assert_called_once()
+
 
 # ===========================================================================
 # OrderExecutor — get_positions

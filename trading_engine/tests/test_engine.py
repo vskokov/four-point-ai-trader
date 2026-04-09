@@ -304,6 +304,31 @@ class TestBarHandler:
         # Should not raise
         engine.bar_handler(_make_bar("AAPL"))
 
+    def test_order_skipped_when_market_closed(self, tmp_path):
+        """bar_handler must not call submit_order when is_market_open() is False."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.6)
+        )
+        mock_alpaca.is_market_open.return_value = False
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_not_called()
+        # Bar still persisted and HMM still updated
+        engine._storage.insert_ohlcv.assert_called_once()
+        engine._hmm["AAPL"].partial_fit_online.assert_called_once()
+
+    def test_order_submitted_when_market_open(self, tmp_path):
+        """bar_handler must call submit_order when is_market_open() is True."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.6)
+        )
+        mock_alpaca.is_market_open.return_value = True
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_called_once()
+
     def test_llm_signal_from_db_used(self, tmp_path):
         engine, mock_storage, _, mwu_map = _build_engine(tmp_path=tmp_path)
 
@@ -1030,6 +1055,19 @@ class TestMarketOpenJobRebalance:
 
         engine.market_open_job()
 
+        engine._executor._trading.submit_order.assert_not_called()
+
+    def test_rebalance_skipped_when_market_closed(self, tmp_path):
+        """_execute_rebalance_orders must skip all orders on a holiday/closed market."""
+        orders = [_make_rebalance_order("AAPL", "buy")]
+        engine, mock_alpaca = _setup_rebalance_engine(tmp_path, rebalance_orders=orders)
+        mock_alpaca.is_market_open.return_value = False
+
+        engine.market_open_job()
+
+        # BL optimisation still ran (weights computed)
+        engine.portfolio_optimizer.compute_black_litterman.assert_called_once()
+        # No orders submitted
         engine._executor._trading.submit_order.assert_not_called()
 
     def test_per_ticker_error_isolation(self, tmp_path):

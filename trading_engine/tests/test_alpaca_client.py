@@ -422,6 +422,124 @@ class TestRetry:
 
 
 # ---------------------------------------------------------------------------
+# AlpacaMarketData — is_market_open / get_market_clock
+# ---------------------------------------------------------------------------
+
+class TestIsMarketOpen:
+
+    def _make_clock(self, is_open: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            is_open=is_open,
+            next_open=_NOW,
+            next_close=_NOW,
+            timestamp=_NOW,
+        )
+
+    def test_returns_true_when_market_open(self, mock_storage, mock_settings):
+        clock = self._make_clock(is_open=True)
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS),
+            patch(_TRADING_CLIENT) as MockTrading,
+        ):
+            MockTrading.return_value.get_clock.return_value = clock
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+            result = client.is_market_open()
+
+        assert result is True
+
+    def test_returns_false_when_market_closed(self, mock_storage, mock_settings):
+        clock = self._make_clock(is_open=False)
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS),
+            patch(_TRADING_CLIENT) as MockTrading,
+        ):
+            MockTrading.return_value.get_clock.return_value = clock
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+            result = client.is_market_open()
+
+        assert result is False
+
+    def test_cache_prevents_duplicate_api_calls(self, mock_storage, mock_settings):
+        """Two calls within 60 seconds must only hit get_clock() once."""
+        clock = self._make_clock(is_open=True)
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS),
+            patch(_TRADING_CLIENT) as MockTrading,
+            patch(f"{_MOD}.time") as mock_time,
+        ):
+            mock_time.monotonic.return_value = 0.0
+            MockTrading.return_value.get_clock.return_value = clock
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+
+            client.is_market_open()
+            assert MockTrading.return_value.get_clock.call_count == 1
+
+            # Second call within the 60-second window
+            mock_time.monotonic.return_value = 30.0
+            client.is_market_open()
+            assert MockTrading.return_value.get_clock.call_count == 1  # still 1
+
+    def test_cache_expires_after_60_seconds(self, mock_storage, mock_settings):
+        """A call more than 60 seconds after the cached result must fetch fresh data."""
+        clock = self._make_clock(is_open=True)
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS),
+            patch(_TRADING_CLIENT) as MockTrading,
+            patch(f"{_MOD}.time") as mock_time,
+        ):
+            mock_time.monotonic.return_value = 0.0
+            MockTrading.return_value.get_clock.return_value = clock
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+
+            client.is_market_open()
+            assert MockTrading.return_value.get_clock.call_count == 1
+
+            # Advance past the 60-second expiry
+            mock_time.monotonic.return_value = 61.0
+            client.is_market_open()
+            assert MockTrading.return_value.get_clock.call_count == 2
+
+
+class TestGetMarketClock:
+
+    def test_returns_all_required_keys(self, mock_storage, mock_settings):
+        clock = SimpleNamespace(
+            is_open=True,
+            next_open=_NOW,
+            next_close=_END,
+            timestamp=_START,
+        )
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS),
+            patch(_TRADING_CLIENT) as MockTrading,
+        ):
+            MockTrading.return_value.get_clock.return_value = clock
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+            result = client.get_market_clock()
+
+        assert set(result.keys()) == {"is_open", "next_open", "next_close", "timestamp"}
+        assert result["is_open"] is True
+        assert result["next_open"] == _NOW
+        assert result["next_close"] == _END
+        assert result["timestamp"] == _START
+
+
+# ---------------------------------------------------------------------------
 # AlpacaNewsClient — fetch_news
 # ---------------------------------------------------------------------------
 

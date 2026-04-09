@@ -131,6 +131,7 @@ class AlpacaMarketData:
             paper=True,
         )
         self._storage = storage
+        self._clock_cache: dict = {}
         logger.info("alpaca_market.init")
 
     # ------------------------------------------------------------------
@@ -415,6 +416,53 @@ class AlpacaMarketData:
 
         logger.info("alpaca_market.account.done", **result)
         return result
+
+    # ------------------------------------------------------------------
+    # Market clock
+    # ------------------------------------------------------------------
+
+    def is_market_open(self) -> bool:
+        """
+        Return *True* if the exchange is currently open.
+
+        Calls Alpaca's ``get_clock()`` API, which accounts for weekends,
+        holidays, and early closes.  Result is cached for 60 seconds to
+        avoid excessive API calls from high-frequency bar_handler invocations.
+        """
+        now_mono = time.monotonic()
+        if self._clock_cache and (now_mono - self._clock_cache["cached_at"]) < 60.0:
+            return self._clock_cache["is_open"]
+
+        clock = _with_retry(self._trading.get_clock, label="get_clock")
+        is_open: bool = bool(clock.is_open)
+
+        if not is_open:
+            logger.debug(
+                "alpaca_market.clock.closed",
+                next_open=str(clock.next_open),
+                next_close=str(clock.next_close),
+            )
+
+        self._clock_cache = {"is_open": is_open, "cached_at": now_mono}
+        return is_open
+
+    def get_market_clock(self) -> dict[str, Any]:
+        """
+        Return detailed market clock information (always fetches fresh data).
+
+        Returns
+        -------
+        dict
+            Keys: ``is_open`` (bool), ``next_open`` (datetime),
+            ``next_close`` (datetime), ``timestamp`` (datetime).
+        """
+        clock = _with_retry(self._trading.get_clock, label="get_clock")
+        return {
+            "is_open":    bool(clock.is_open),
+            "next_open":  clock.next_open,
+            "next_close": clock.next_close,
+            "timestamp":  clock.timestamp,
+        }
 
 
 # ---------------------------------------------------------------------------

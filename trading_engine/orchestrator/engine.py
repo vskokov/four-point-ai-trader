@@ -495,19 +495,24 @@ class TradingEngine:
 
         # 6. Order submission
         if final_signal != 0:
-            try:
-                account_info = self._alpaca.get_account_info()
-                self._executor.submit_order(
-                    ticker=ticker,
-                    signal=final_signal,
-                    confidence=abs(decision["score"]),
-                    account_info=account_info,
-                    signal_stats=self._signal_stats[ticker],
+            if not self._alpaca.is_market_open():
+                logger.debug(
+                    "engine.bar_handler.order_skipped_market_closed", ticker=ticker
                 )
-            except Exception as exc:
-                logger.error(
-                    "engine.order_failed", ticker=ticker, error=str(exc)
-                )
+            else:
+                try:
+                    account_info = self._alpaca.get_account_info()
+                    self._executor.submit_order(
+                        ticker=ticker,
+                        signal=final_signal,
+                        confidence=abs(decision["score"]),
+                        account_info=account_info,
+                        signal_stats=self._signal_stats[ticker],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "engine.order_failed", ticker=ticker, error=str(exc)
+                    )
 
         # 7. Circuit breaker check (after any order attempt)
         try:
@@ -637,6 +642,10 @@ class TradingEngine:
                 "engine.rebalance.halted_circuit_breaker",
                 equity=equity,
             )
+            return
+
+        if not self._alpaca.is_market_open():
+            logger.warning("engine.rebalance.skipped_market_closed")
             return
 
         # Fetch current open positions

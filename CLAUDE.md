@@ -19,6 +19,8 @@ All runnable code lives under `trading_engine/`.
 | **4 — Meta-agent** | MWU ensemble agent conditioned on HMM regime | **Complete** |
 | **5 — Execution** | RiskManager (Kelly + circuit breakers), OrderExecutor, TradingEngine orchestrator, StateManager | **Complete** |
 | **6 — Portfolio** | PortfolioOptimizer (Black-Litterman + Min-Variance, LedoitWolf, daily rebalance job) | **Complete** |
+| **7 — Pair discovery** | Standalone pair scanner, JSON-driven pair loading, log-return correlation pre-filter | **Complete** |
+| **8 — Market-open guard** | Alpaca clock API (`is_market_open`), 60 s cache, three order-path guards | **Complete** |
 
 ---
 
@@ -537,3 +539,26 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     co-movement of actual returns and is the correct input to the cointegration
     screening step.  A pair must clear `min_correlation=0.70` on log-returns
     before the more expensive EG test is run.
+
+57. **`AlpacaMarketData.is_market_open()` is the single source of truth for whether
+    orders can be submitted** — it calls Alpaca's `get_clock()` API which accounts
+    for weekends, holidays, and early closes.  The result is cached for 60 seconds
+    via `_clock_cache` (a dict with `is_open` and `cached_at` keys) to avoid
+    excessive API calls from high-frequency `bar_handler` invocations.  Tests must
+    mock `_trading.get_clock` and control the cache expiry by patching
+    `trading_engine.data.alpaca_client.time` (the module-level import) so that
+    `time.monotonic()` returns a controlled value.
+
+58. **Three order paths are guarded by `is_market_open()`** —
+    (1) `submit_order` checks at the top (before `signal == 0`) and returns
+    `{"status": "skipped", "reason": "market_closed"}`; (2) `_execute_rebalance_orders`
+    checks after the circuit-breaker gate and returns early; (3) `bar_handler`
+    checks before calling `submit_order` to avoid the unnecessary
+    `get_account_info()` call.  Signal computation (HMM, OU, LLM query) still
+    runs regardless of market status — only order submission is blocked.
+
+59. **APScheduler cron triggers fire on `day_of_week="mon-fri"` but do NOT know
+    about exchange holidays** — the `is_market_open()` guard inside
+    `_execute_rebalance_orders` is what prevents orders on holidays like MLK Day,
+    Good Friday, etc.  The sentiment and portfolio optimisation jobs still run on
+    holidays (computing weights is harmless) — only order execution is blocked.

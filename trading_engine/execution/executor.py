@@ -343,6 +343,7 @@ class OrderExecutor:
             One of::
 
                 {"status": "no_op"}
+                {"status": "skipped", "reason": "market_closed"}
                 {"status": "rejected", "reason": str}
                 {"status": "too_small"}
                 {"status": "no_position"}   # sell with no open position
@@ -350,6 +351,12 @@ class OrderExecutor:
                  "qty": int, "estimated_price": float,
                  "timestamp": str, "order_id": str}
         """
+        if not self._alpaca.is_market_open():
+            logger.info(
+                "executor.order_skipped_market_closed", ticker=ticker, signal=signal
+            )
+            return {"status": "skipped", "reason": "market_closed"}
+
         if signal == 0:
             return {"status": "no_op"}
 
