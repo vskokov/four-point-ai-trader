@@ -238,7 +238,7 @@ class AlphaVantageNewsClient:
             "function": "NEWS_SENTIMENT",
             "tickers":  ",".join(tickers),
             "time_from": time_from,
-            "limit":    "200",
+            "limit":    "50",
             "apikey":   self._api_key,
         }
 

@@ -201,7 +201,7 @@ class TestFetchNewsHappyPath:
         params = kwargs["params"]
         assert params["function"] == "NEWS_SENTIMENT"
         assert params["tickers"] == "AAPL,MSFT"
-        assert params["limit"] == "200"
+        assert params["limit"] == "50"
         assert params["apikey"] == "fake-av-key"
         # time_from should be a YYYYMMDDTHHMM string
         assert len(params["time_from"]) == 13
