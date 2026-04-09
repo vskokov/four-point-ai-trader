@@ -18,6 +18,9 @@ trading_engine/backtesting/results/
 # Alpha Vantage rate state (auto-created, local only)
 trading_engine/config/av_rate_state.json
 
+# Discovered pairs (local scan output — regenerate with pair_scanner.py)
+trading_engine/config/discovered_pairs.json
+
 # IDE
 .idea/
 .vscode/

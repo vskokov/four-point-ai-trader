@@ -222,6 +222,15 @@ cd trading_engine
     --max-pairs 10
 ```
 
+To automate the weekly rescan, add a cron entry (`crontab -e`):
+
+```
+0 8 * * 1 cd /path/to/four-point-ai-trader && trading_engine/.venv/bin/python -m trading_engine.tools.pair_scanner --tickers AAPL MSFT ... --lookback-days 504 --min-correlation 0.50 --max-pvalue 0.05 --min-half-life 5 --max-half-life 60 --max-pairs 20 >> /tmp/pair_scanner.log 2>&1
+```
+
+This fires every Monday at 08:00. Replace the ticker list with your universe.
+`discovered_pairs.json` is gitignored — each environment maintains its own.
+
 | Flag | Default | Description |
 |---|---|---|
 | `--tickers` | required | Ticker universe to scan |
