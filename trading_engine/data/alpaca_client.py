@@ -409,6 +409,9 @@ class AlpacaMarketData:
 
         result = {
             "equity":          float(account.equity),
+            # cash = settled cash balance (not margin buying power).
+            # All order sizing must use cash, not equity or buying_power,
+            # to enforce cash-only trading (no margin).
             "cash":            float(account.cash),
             "buying_power":    float(account.buying_power),
             "portfolio_value": float(account.portfolio_value),

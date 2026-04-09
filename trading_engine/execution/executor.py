@@ -61,6 +61,10 @@ class RiskManager:
     peak_equity       — high-water mark; updated on every check.
     daily_start_equity — equity at first check of each UTC trading day; resets
                          at midnight UTC.
+
+    Note: circuit breakers use equity (portfolio value) for drawdown measurement.
+    Cash constraints are enforced separately in OrderExecutor.submit_order()
+    and TradingEngine._execute_rebalance_orders().
     """
 
     def __init__(
@@ -195,6 +199,7 @@ class RiskManager:
 
         if signal == 1:  # buy — enforce per-position size limit
             equity = float(account_info["equity"])
+            cash   = float(account_info["cash"])
             pos = current_positions.get(ticker, {})
             current_mv = float(pos.get("market_value", 0.0))
             current_pct = current_mv / equity if equity > 0 else 0.0
@@ -206,7 +211,8 @@ class RiskManager:
                     "max_size": 0.0,
                 }
 
-            max_size = (self.max_position_pct - current_pct) * equity
+            max_size_by_limit = (self.max_position_pct - current_pct) * equity
+            max_size = min(max_size_by_limit, cash)  # never exceed available cash
             return {"approved": True, "reason": "ok", "max_size": max_size}
 
         # sell (-1) — circuit breaker already checked; no size limit on reducing
@@ -381,27 +387,48 @@ class OrderExecutor:
         quote = self._alpaca.get_latest_quote(ticker)
         current_price: float = quote["mid"]
 
-        # Portfolio-optimizer sizing (overrides Kelly when a target weight exists)
+        # Portfolio-optimizer sizing (buy only — overrides Kelly when a target weight exists).
+        # Buys are sized off cash; sells size off equity (sells free cash, not consume it).
         _use_kelly = True
-        if self.portfolio_optimizer is not None:
+        if self.portfolio_optimizer is not None and signal == 1:
             target_w = self.portfolio_optimizer.get_target_weight(ticker)
             if target_w > 0.0:
                 _use_kelly = False
-                equity = float(account_info["equity"])
-                size_usd = equity * target_w * confidence
-                max_usd = equity * self._risk.max_position_pct
+                cash = float(account_info["cash"])
+                size_usd = cash * target_w * confidence
+                max_usd = cash * self._risk.max_position_pct
                 size_usd = min(size_usd, max_usd)
                 n_shares = int(size_usd / current_price) if current_price > 0 else 0
 
         if _use_kelly:
-            # Fractional Kelly sizing
             kelly_f = self._risk.kelly_size(
                 win_rate=float(signal_stats["win_rate"]),
                 avg_win=float(signal_stats["avg_win"]),
                 avg_loss=float(signal_stats["avg_loss"]),
             )
-            size_usd = float(account_info["equity"]) * kelly_f * confidence
+            # Buys: sized off cash to enforce no-margin constraint.
+            # Sells: sized off equity (position value); capped at held shares below.
+            sizing_base = (
+                float(account_info["cash"]) if signal == 1
+                else float(account_info["equity"])
+            )
+            size_usd = sizing_base * kelly_f * confidence
             n_shares = math.floor(size_usd / current_price) if current_price > 0 else 0
+
+        # Belt-and-suspenders: hard cash cap for buys regardless of sizing path.
+        # Sells free cash rather than consuming it — no cash constraint applies.
+        if signal == 1:
+            available_cash = float(account_info["cash"])
+            order_cost = n_shares * current_price
+            if order_cost > available_cash:
+                n_shares = int(available_cash / current_price) if current_price > 0 else 0
+                logger.info(
+                    "executor.order_capped_by_cash",
+                    ticker=ticker,
+                    original_cost=round(order_cost, 2),
+                    available_cash=round(available_cash, 2),
+                    capped_shares=n_shares,
+                )
 
         if n_shares == 0:
             logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)

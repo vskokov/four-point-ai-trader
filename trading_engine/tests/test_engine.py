@@ -1092,3 +1092,117 @@ class TestMarketOpenJobRebalance:
 
         # All 3 attempted; MSFT threw but AAPL and JPM succeeded
         assert engine._executor._trading.submit_order.call_count == 3
+
+    def test_rebalance_refetches_cash_after_sells(self, tmp_path):
+        """
+        _execute_rebalance_orders must re-fetch account after the sell phase to
+        get the updated cash balance.  Buys should proceed with the post-sell cash.
+        """
+        orders = [
+            _make_rebalance_order("JPM",  "sell", dollar_amount=3_000.0),
+            _make_rebalance_order("AAPL", "buy",  dollar_amount=5_000.0),
+        ]
+        positions = _positions_df(("JPM", 20.0, 3_000.0))
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=positions, equity=5_000.0
+        )
+
+        # First call (circuit-breaker gate): small account, $5K cash
+        # Second call (after sells):         bigger cash from proceeds
+        initial_account = {
+            "equity": 5_000.0, "cash": 5_000.0,
+            "buying_power": 10_000.0, "portfolio_value": 5_000.0,
+        }
+        updated_account = {
+            "equity": 25_000.0, "cash": 25_000.0,
+            "buying_power": 50_000.0, "portfolio_value": 25_000.0,
+        }
+        mock_alpaca.get_account_info.side_effect = [initial_account, updated_account]
+
+        submitted_symbols: list[str] = []
+
+        def capture(req):
+            submitted_symbols.append(req.symbol)
+            return SimpleNamespace(id="ok")
+
+        engine._executor._trading.submit_order.side_effect = capture
+
+        engine.market_open_job()
+
+        # Sell ran first, buy ran after; account fetched twice
+        assert len(submitted_symbols) == 2
+        assert submitted_symbols[0] == "JPM"
+        assert submitted_symbols[1] == "AAPL"
+        assert mock_alpaca.get_account_info.call_count == 2
+
+    def test_rebalance_buy_capped_by_available_cash(self, tmp_path):
+        """
+        When buys total more than available cash, orders are filled sequentially
+        until cash runs out; remaining buys are skipped with no_cash_remaining.
+
+        With price=$1000/share, 3×$10K buy orders, and $20K cash:
+          - Buy 1 (10 shares, $10K): succeeds, available → $10K
+          - Buy 2 (10 shares, $10K): succeeds, available → $0
+          - Buy 3:  available_cash=0 → skipped
+        """
+        orders = [
+            _make_rebalance_order("AAPL", "buy", dollar_amount=10_000.0),
+            _make_rebalance_order("MSFT", "buy", dollar_amount=10_000.0),
+            _make_rebalance_order("JPM",  "buy", dollar_amount=10_000.0),
+        ]
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=_positions_df(), equity=100_000.0
+        )
+
+        # Circuit-breaker call returns normal account; post-sell refetch shows $20K cash
+        initial_account = _account(100_000.0)
+        post_sell_account = {
+            "equity":          100_000.0,
+            "cash":             20_000.0,
+            "buying_power":    200_000.0,
+            "portfolio_value": 100_000.0,
+        }
+        mock_alpaca.get_account_info.side_effect = [initial_account, post_sell_account]
+
+        # Shares: $10K / $1000 = 10 per order; deduct $10K each
+        mock_alpaca.get_latest_quote.return_value = {
+            "mid": 1_000.0, "bid": 999.9, "ask": 1_000.1
+        }
+
+        submitted_symbols: list[str] = []
+
+        def capture(req):
+            submitted_symbols.append(req.symbol)
+            return SimpleNamespace(id="ok")
+
+        engine._executor._trading.submit_order.side_effect = capture
+
+        engine.market_open_job()
+
+        # Only 2 of 3 buys executed; third skipped (no cash)
+        assert len(submitted_symbols) == 2
+        assert "AAPL" in submitted_symbols
+        assert "MSFT" in submitted_symbols
+        assert "JPM" not in submitted_symbols
+
+    def test_rebalance_skips_all_buys_if_cash_refetch_fails(self, tmp_path):
+        """
+        If get_account_info raises after the sell phase, all pending buys must
+        be skipped and no orders submitted for the buy phase.
+        """
+        orders = [
+            _make_rebalance_order("AAPL", "buy", dollar_amount=5_000.0),
+            _make_rebalance_order("MSFT", "buy", dollar_amount=5_000.0),
+        ]
+        engine, mock_alpaca = _setup_rebalance_engine(tmp_path, rebalance_orders=orders)
+
+        # First call succeeds (circuit-breaker gate); second raises (cash refetch)
+        mock_alpaca.get_account_info.side_effect = [
+            _account(100_000.0),
+            RuntimeError("Alpaca API down"),
+        ]
+
+        engine.market_open_job()
+
+        # No buy orders should have been submitted
+        engine._executor._trading.submit_order.assert_not_called()

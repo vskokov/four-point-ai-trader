@@ -661,10 +661,10 @@ class TradingEngine:
         buys  = [o for o in orders if o["action"] == "buy"]
         n_executed = n_skipped = n_errors = 0
 
-        for order in sells + buys:   # sells first — free up capital before buying
+        # ---- Phase 1: execute all sells first to free up capital ----
+        for order in sells:
             ticker = order["ticker"]
             dollar_amount = float(order["dollar_amount"])
-            action = order["action"]
 
             try:
                 quote = self._alpaca.get_latest_quote(ticker)
@@ -684,26 +684,22 @@ class TradingEngine:
                     n_skipped += 1
                     continue
 
-                if action == "sell":
-                    # Cap at currently held quantity to avoid over-selling
-                    held = 0
-                    if not positions.empty and "ticker" in positions.columns:
-                        pos_row = positions[positions["ticker"] == ticker]
-                        if not pos_row.empty:
-                            held = int(float(pos_row.iloc[0]["qty"]))
-                    if held <= 0:
-                        logger.debug("engine.rebalance.sell_no_position", ticker=ticker)
-                        n_skipped += 1
-                        continue
-                    n_shares = min(n_shares, held)
-                    side = OrderSide.SELL
-                else:
-                    side = OrderSide.BUY
+                # Cap at currently held quantity to avoid over-selling
+                held = 0
+                if not positions.empty and "ticker" in positions.columns:
+                    pos_row = positions[positions["ticker"] == ticker]
+                    if not pos_row.empty:
+                        held = int(float(pos_row.iloc[0]["qty"]))
+                if held <= 0:
+                    logger.debug("engine.rebalance.sell_no_position", ticker=ticker)
+                    n_skipped += 1
+                    continue
+                n_shares = min(n_shares, held)
 
                 order_req = MarketOrderRequest(
                     symbol=ticker,
                     qty=n_shares,
-                    side=side,
+                    side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY,
                 )
                 submitted = self._executor._trading.submit_order(order_req)
@@ -711,7 +707,7 @@ class TradingEngine:
                 logger.info(
                     "engine.rebalance.order_submitted",
                     ticker=ticker,
-                    action=action,
+                    action="sell",
                     qty=n_shares,
                     dollar_amount=round(dollar_amount, 2),
                     target_weight=order["target_weight"],
@@ -723,7 +719,93 @@ class TradingEngine:
                 logger.error(
                     "engine.rebalance.order_failed",
                     ticker=ticker,
-                    action=action,
+                    action="sell",
+                    error=str(exc),
+                )
+
+        # ---- Phase 2: re-fetch cash after sells, then execute buys ----
+        try:
+            account_info = self._alpaca.get_account_info()
+            available_cash = float(account_info["cash"])
+        except Exception as exc:
+            logger.error("engine.rebalance.cash_refetch_failed", error=str(exc))
+            n_skipped += len(buys)
+            logger.info(
+                "engine.rebalance.summary",
+                n_executed=n_executed,
+                n_skipped=n_skipped,
+                n_errors=n_errors,
+                n_sells=len(sells),
+                n_buys=len(buys),
+            )
+            return
+
+        logger.info(
+            "engine.rebalance.cash_after_sells",
+            available_cash=round(available_cash, 2),
+        )
+
+        for order in buys:
+            ticker = order["ticker"]
+            dollar_amount = float(order["dollar_amount"])
+
+            # Cap buy at remaining available cash
+            if dollar_amount > available_cash:
+                if available_cash <= 0:
+                    logger.info("engine.rebalance.no_cash_remaining", ticker=ticker)
+                    n_skipped += 1
+                    continue
+                logger.info(
+                    "engine.rebalance.buy_capped_by_cash",
+                    ticker=ticker,
+                    requested=round(dollar_amount, 2),
+                    available=round(available_cash, 2),
+                )
+                dollar_amount = available_cash
+
+            try:
+                quote = self._alpaca.get_latest_quote(ticker)
+                price = float(quote["mid"])
+                if price <= 0:
+                    logger.warning("engine.rebalance.zero_price", ticker=ticker)
+                    n_skipped += 1
+                    continue
+
+                n_shares = int(dollar_amount / price)
+                if n_shares <= 0:
+                    logger.debug(
+                        "engine.rebalance.order_too_small",
+                        ticker=ticker,
+                        dollar_amount=dollar_amount,
+                    )
+                    n_skipped += 1
+                    continue
+
+                order_req = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=n_shares,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+                submitted = self._executor._trading.submit_order(order_req)
+                available_cash -= n_shares * price   # track cash spend
+                n_executed += 1
+                logger.info(
+                    "engine.rebalance.order_submitted",
+                    ticker=ticker,
+                    action="buy",
+                    qty=n_shares,
+                    dollar_amount=round(dollar_amount, 2),
+                    target_weight=order["target_weight"],
+                    order_id=str(submitted.id),
+                )
+
+            except Exception as exc:
+                n_errors += 1
+                logger.error(
+                    "engine.rebalance.order_failed",
+                    ticker=ticker,
+                    action="buy",
                     error=str(exc),
                 )
 

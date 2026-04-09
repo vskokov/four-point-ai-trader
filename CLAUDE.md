@@ -562,3 +562,28 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     `_execute_rebalance_orders` is what prevents orders on holidays like MLK Day,
     Good Friday, etc.  The sentiment and portfolio optimisation jobs still run on
     holidays (computing weights is harmless) — only order execution is blocked.
+
+60. **All buy-side sizing uses `account_info["cash"]`, never `equity` or `buying_power`** —
+    this enforces cash-only trading with no margin.  Both the portfolio-optimizer path
+    and the Kelly path in `submit_order` size off `cash`.  After sizing, a hard
+    belt-and-suspenders cap (`if signal == 1`) ensures the order cost never exceeds
+    `cash` even if the sizing math is wrong.  `equity` is still used for
+    position-limit percentage checks (`current_mv / equity`) and circuit-breaker
+    drawdown tracking — both measure portfolio health, not purchasing power.  Sell
+    orders have no cash constraint: they free cash rather than consuming it.
+
+61. **`_execute_rebalance_orders` re-fetches `account_info` after all sells complete** —
+    the sell loop runs first, then `get_account_info()` is called a second time to
+    get the updated `cash` balance (Alpaca's account state is stale until sells are
+    acknowledged).  Buys run sequentially and `available_cash` is decremented locally
+    after each successful submission.  If the re-fetch raises, all buys are skipped,
+    a summary log is emitted, and the method returns immediately.  Tests that cover
+    the buy phase must stub `get_account_info` with a `side_effect` list:
+    `[circuit_breaker_account, post_sell_account]`.
+
+62. **`RiskManager.check_trade` returns `max_size = min(position_limit_headroom, cash)`** —
+    the position-limit percentage is computed relative to `equity` (so a 10% limit on
+    a $200K portfolio means $20K per position regardless of cash split), but the actual
+    `max_size` dollar amount is capped at `cash`.  Tests that assert on `max_size` must
+    set both `equity` and `cash` in the mock `account_info`; passing only `equity`
+    (with `cash` absent or zero) will cause an unexpected `KeyError` or a zero cap.

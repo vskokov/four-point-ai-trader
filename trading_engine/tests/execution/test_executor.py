@@ -342,20 +342,22 @@ class TestSubmitOrder:
         mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
         executor = _make_executor(mock_trading, mock_alpaca)
 
-        # equity=100_000, kelly_f=0.10, confidence=1.0 → size_usd=10_000 → 100 shares
+        # cash=80_000 (equity*0.8), kelly_f≈0.10, confidence=1.0 → size_usd≈8_000 → ~79-80 shares
         result = executor.submit_order("AAPL", 1, 1.0, _account(100_000), _signal_stats())
 
         assert result["status"] == "submitted"
         assert result["ticker"] == "AAPL"
         assert result["side"] == "buy"
-        assert result["qty"] == 100
+        # Buy sized off cash (80K), not equity (100K) → qty < 100
+        assert result["qty"] < 100
+        assert result["qty"] > 0
         assert result["estimated_price"] == 100.0
         assert "order_id" in result
         assert "timestamp" in result
 
         call_args = mock_trading.submit_order.call_args[0][0]
         assert call_args.symbol == "AAPL"
-        assert call_args.qty == 100
+        assert call_args.qty == result["qty"]
 
     def test_sell_order_submitted_correctly(self):
         mock_trading = MagicMock()
@@ -366,7 +368,8 @@ class TestSubmitOrder:
         mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
         executor = _make_executor(mock_trading, mock_alpaca)
 
-        # sell signal — cap at min(100 computed, 200 held) = 100
+        # sell signal — sized off equity=100K (sells are not cash-constrained)
+        # kelly_f≈0.10, confidence=1.0 → ~100 shares computed; cap at min(100, 200) = 100
         result = executor.submit_order("AAPL", -1, 1.0, _account(100_000), _signal_stats())
 
         assert result["status"] == "submitted"
@@ -404,12 +407,13 @@ class TestSubmitOrder:
         mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
         executor = _make_executor(mock_trading, mock_alpaca)
 
-        # confidence=0.5 should halve the share count vs confidence=1.0
+        # confidence=0.5 should roughly halve the share count vs confidence=1.0
         r_full = executor.submit_order("AAPL", 1, 1.0, _account(100_000), _signal_stats())
         mock_trading.get_all_positions.return_value = []
         r_half = executor.submit_order("AAPL", 1, 0.5, _account(100_000), _signal_stats())
 
-        assert r_full["qty"] == r_half["qty"] * 2
+        # Allow ±1 tolerance from floor() rounding with floating-point kelly
+        assert abs(r_full["qty"] - r_half["qty"] * 2) <= 1
 
     def test_returns_skipped_when_market_closed(self):
         """submit_order must short-circuit with status=skipped when market is closed."""
@@ -548,3 +552,99 @@ class TestOrderExecutorInit:
                 secret_key="fake-secret",
                 paper=False,
             )
+
+
+# ===========================================================================
+# Cash-only trading enforcement
+# ===========================================================================
+
+class TestCashOnlyTrading:
+    """Verify that all buy-side sizing is based on cash, not equity."""
+
+    def _make_mock_alpaca(self, mid_price: float = 100.0) -> MagicMock:
+        mock = MagicMock()
+        mock.get_latest_quote.return_value = {"mid": mid_price, "bid": mid_price - 0.1, "ask": mid_price + 0.1}
+        return mock
+
+    def test_buy_sized_off_cash_not_equity(self):
+        """With equity=200K but cash=10K, buy qty must be much less than equity-based qty."""
+        mock_trading = MagicMock()
+        mock_trading.get_all_positions.return_value = []
+        mock_trading.submit_order.return_value = _fake_order()
+        mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
+        executor = _make_executor(mock_trading, mock_alpaca)
+
+        account = {
+            "equity":          200_000.0,
+            "cash":             10_000.0,
+            "buying_power":    400_000.0,
+            "portfolio_value": 200_000.0,
+        }
+        # kelly_f ≈ 0.10, price = 100
+        # cash-based:   10_000 * ~0.10 / 100 ≈ 10 shares
+        # equity-based: 200_000 * ~0.10 / 100 ≈ 200 shares (must NOT happen)
+        result = executor.submit_order("AAPL", 1, 1.0, account, _signal_stats())
+
+        assert result["status"] == "submitted"
+        # Verify sizing is cash-based: qty must be well below the equity-based value
+        assert result["qty"] <= 15    # cash-based (~10), not equity-based (~200)
+        assert result["qty"] * 100.0 <= 10_000.0   # order cost ≤ available cash
+
+    def test_hard_cash_cap_limits_buy_shares(self):
+        """Hard cap ensures order cost never exceeds available cash even after sizing."""
+        mock_trading = MagicMock()
+        mock_trading.get_all_positions.return_value = []
+        mock_trading.submit_order.return_value = _fake_order()
+        mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
+        executor = _make_executor(mock_trading, mock_alpaca)
+
+        account = {
+            "equity":          100_000.0,
+            "cash":              5_000.0,
+            "buying_power":    200_000.0,
+            "portfolio_value": 100_000.0,
+        }
+        result = executor.submit_order("AAPL", 1, 1.0, account, _signal_stats())
+
+        assert result["status"] == "submitted"
+        # Order cost must never exceed available cash (hard cap guarantees this)
+        assert result["qty"] * 100.0 <= 5_000.0
+
+    def test_sell_not_blocked_by_zero_cash(self):
+        """Sell orders must succeed even when cash=0 (sells free cash, not consume it)."""
+        mock_trading = MagicMock()
+        mock_trading.get_all_positions.return_value = [
+            _fake_position("AAPL", 50.0, 5_000.0)
+        ]
+        mock_trading.submit_order.return_value = _fake_order()
+        mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
+        executor = _make_executor(mock_trading, mock_alpaca)
+
+        account = {
+            "equity":          100_000.0,
+            "cash":                  0.0,   # no cash
+            "buying_power":          0.0,
+            "portfolio_value":   100_000.0,
+        }
+        result = executor.submit_order("AAPL", -1, 1.0, account, _signal_stats())
+
+        # Sell should go through; cash cap only applies to buys
+        assert result["status"] == "submitted"
+        assert result["side"] == "sell"
+        mock_trading.submit_order.assert_called_once()
+
+    def test_check_trade_max_size_capped_at_cash(self):
+        """check_trade max_size must not exceed available cash."""
+        rm = _make_risk_manager(max_position_pct=0.10)
+
+        account = {
+            "equity":          200_000.0,
+            "cash":             10_000.0,   # far less than 10% of equity (20K)
+            "buying_power":    400_000.0,
+            "portfolio_value": 200_000.0,
+        }
+        result = rm.check_trade("AAPL", 1, account, {})
+
+        assert result["approved"] is True
+        # 10% of 200K = 20K, but cash is only 10K → max_size must be 10K
+        assert result["max_size"] == pytest.approx(10_000.0)

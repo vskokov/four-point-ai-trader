@@ -39,8 +39,8 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 | **LLM sentiment** | Local Ollama (Gemma 4 e4b) scores news headlines into directional signals; retries on malformed JSON; 60-second timeout → safe neutral fallback |
 | **Meta-agent** | Multiplicative Weights Update (MWU) ensemble conditioned on HMM regime; per-regime weight isolation; online learning from realised price directions |
 | **Backtesting** | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results |
-| **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys) |
-| **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 %); peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
+| **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys, cash re-fetched after sells) |
+| **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
 | **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes |
 | **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
 
@@ -82,7 +82,7 @@ trading_engine/
 ├── models/                      # Auto-created; HMM .pkl, Kalman .pkl, MWU .npy
 ├── utils/
 │   └── logging.py               # structlog factory (JSON file + console)
-├── tests/                       # 392 unit tests — no live connections required
+├── tests/                       # 409 unit tests — no live connections required
 │   ├── tools/
 │   │   └── test_pair_scanner.py
 │   └── ...
@@ -131,10 +131,11 @@ New bar arrives
               └── if closed → skip order (bar still fully processed)
             RiskManager.check_trade()
               ├── circuit breaker (drawdown / daily loss)
-              └── position size limit
+              └── position size limit (max_size capped at available cash)
             RiskManager.kelly_size(win_rate, avg_win, avg_loss)
-            size_usd = equity × kelly_f × confidence
+            size_usd = cash × kelly_f × confidence   ← cash, not equity
             n_shares = floor(size_usd / mid_price)
+            [hard cap: n_shares × price ≤ cash]
             TradingClient.submit_order(MarketOrderRequest, DAY)
 ```
 
@@ -280,11 +281,13 @@ positions are liquidated before exit.
 
 | Control | Default | Description |
 |---|---|---|
-| Max position per ticker | 10 % of equity | `RiskManager.max_position_pct` |
+| Cash-only sizing | — | All buy orders sized off `account.cash`, never `equity` or `buying_power`; no margin used |
+| Max position per ticker | 10 % of equity | Position limit % measured against equity; dollar cap further constrained to available cash |
 | Peak drawdown halt | 15 % | Triggers circuit breaker, liquidates all positions |
 | Daily loss halt | 5 % | Triggers circuit breaker, liquidates all positions |
 | Kelly fraction | ¼ Kelly | `RiskManager.kelly_fraction` |
-| Order type | Market / DAY | No limit orders; sells capped at held quantity |
+| Order type | Market / DAY | No limit orders; sells capped at held quantity; sells are not cash-constrained |
+| Rebalance cash gate | — | Cash re-fetched after sells; each buy deducts from `available_cash`; insufficient cash → buy skipped |
 
 The circuit breaker fires **before** any order on every bar and before every
 portfolio rebalance. If triggered it sets an emergency flag, signals the
@@ -298,7 +301,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 401 tests, no live connections required
+# Unit tests — 409 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -325,12 +328,12 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_llm_sentiment.py` | 50 | LLM prompt, parse, retry, pipeline |
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
-| `test_executor.py` | 43 | RiskManager, Kelly sizing, OrderExecutor; market-closed guard |
-| `test_engine.py` | 62 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; market-closed guard |
+| `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
+| `test_engine.py` | 65 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **401** | |
+| **Total (unit)** | **409** | |
 
 ---
 
@@ -356,7 +359,7 @@ HMM models, Kalman filters, and MWU weights are persisted by their own modules
 |---|---|---|
 | `sentiment_job_early` | Every 25 min, 07:00–10:29 ET Mon–Fri | Alpha Vantage fetch → Gemma scoring → `signal_log` insert |
 | `sentiment_job_late` | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (different cadence for budget management) |
-| `market_open_job` | 09:31 ET Mon–Fri | Black-Litterman portfolio optimisation → rebalance execution |
+| `market_open_job` | 09:31 ET Mon–Fri | Black-Litterman portfolio optimisation → rebalance execution (cash-gated buys) |
 | `eod_job` | 16:05 ET Mon–Fri | P&L log, MWU performance report, Kelly stat refresh, state save |
 
 Alpha Vantage budget: ~8 (early) + ~10 (late) ≈ 18 calls/day out of the 25
@@ -377,6 +380,7 @@ is also at 20.
 | 6 — Portfolio | Black-Litterman + Min-Variance optimisation, daily rebalance | Complete |
 | 7 — Pair discovery | Standalone cointegration scanner, JSON-driven pair loading | Complete |
 | 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe | Complete |
+| 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate | Complete |
 
 ---
 
