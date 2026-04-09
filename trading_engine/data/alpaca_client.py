@@ -124,6 +124,7 @@ class AlpacaMarketData:
         self._stream = StockDataStream(
             api_key=settings.ALPACA_API_KEY,
             secret_key=settings.ALPACA_SECRET_KEY,
+            feed="iex",   # free-tier accounts cannot access SIP feed
         )
         self._trading = TradingClient(
             api_key=settings.ALPACA_API_KEY,
@@ -182,6 +183,7 @@ class AlpacaMarketData:
             timeframe=_TIMEFRAME_MAP[timeframe],
             start=start,
             end=end,
+            feed="iex",   # free-tier accounts cannot access SIP feed
         )
         bar_set = _with_retry(
             lambda: self._hist.get_stock_bars(request),
@@ -262,6 +264,7 @@ class AlpacaMarketData:
             timeframe=_TIMEFRAME_MAP[timeframe],
             start=start,
             end=end,
+            feed="iex",   # free-tier accounts cannot access SIP feed
         )
         bar_set = _with_retry(
             lambda: self._hist.get_stock_bars(request),
@@ -308,7 +311,7 @@ class AlpacaMarketData:
         """
         logger.info("alpaca_market.latest_quote.start", ticker=ticker)
 
-        request = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+        request = StockLatestQuoteRequest(symbol_or_symbols=ticker, feed="iex")
         quotes = _with_retry(
             lambda: self._hist.get_stock_latest_quote(request),
             label="get_stock_latest_quote",
