@@ -24,19 +24,21 @@ import pytest
 # Patch targets
 # ---------------------------------------------------------------------------
 
-_ENG_MOD    = "trading_engine.orchestrator.engine"
-_STORAGE    = f"{_ENG_MOD}.Storage"
-_ALPACA     = f"{_ENG_MOD}.AlpacaMarketData"
-_AV_CLIENT  = f"{_ENG_MOD}.AlphaVantageNewsClient"
-_HMM        = f"{_ENG_MOD}.HMMRegimeDetector"
-_LLM        = f"{_ENG_MOD}.LLMSentimentSignal"
-_MWU        = f"{_ENG_MOD}.MWUMetaAgent"
-_OU_SIGNAL  = f"{_ENG_MOD}.OUSpreadSignal"
-_RISK       = f"{_ENG_MOD}.RiskManager"
-_EXECUTOR   = f"{_ENG_MOD}.OrderExecutor"
-_SCHEDULER  = f"{_ENG_MOD}.BackgroundScheduler"
-_SETTINGS   = f"{_ENG_MOD}.settings"
-_STATE_MGR  = f"{_ENG_MOD}.StateManager"
+_ENG_MOD        = "trading_engine.orchestrator.engine"
+_STORAGE        = f"{_ENG_MOD}.Storage"
+_ALPACA         = f"{_ENG_MOD}.AlpacaMarketData"
+_AV_CLIENT      = f"{_ENG_MOD}.AlphaVantageNewsClient"
+_ALPACA_NEWS    = f"{_ENG_MOD}.AlpacaNewsClient"
+_FUNDAMENTALS   = f"{_ENG_MOD}.FundamentalsClient"
+_HMM            = f"{_ENG_MOD}.HMMRegimeDetector"
+_LLM            = f"{_ENG_MOD}.LLMSentimentSignal"
+_MWU            = f"{_ENG_MOD}.MWUMetaAgent"
+_OU_SIGNAL      = f"{_ENG_MOD}.OUSpreadSignal"
+_RISK           = f"{_ENG_MOD}.RiskManager"
+_EXECUTOR       = f"{_ENG_MOD}.OrderExecutor"
+_SCHEDULER      = f"{_ENG_MOD}.BackgroundScheduler"
+_SETTINGS       = f"{_ENG_MOD}.settings"
+_STATE_MGR      = f"{_ENG_MOD}.StateManager"
 
 
 # ---------------------------------------------------------------------------
@@ -180,21 +182,29 @@ def _build_engine(
     mock_state = MagicMock()
     mock_state.load.return_value = None
 
+    # Fundamentals + Alpaca news mocks (used by sentiment_job)
+    mock_fundamentals = MagicMock()
+    mock_fundamentals.get_market_caps.return_value = {t: 1e12 for t in tickers}
+    mock_alpaca_news = MagicMock()
+    mock_alpaca_news.fetch_news.return_value = []
+
     # Wire everything onto the engine
     engine.portfolio_optimizer = MagicMock()
-    engine._tickers     = list(tickers)
-    engine._pairs       = [tuple(p) for p in pairs]
-    engine._paper       = True
-    engine._models_dir  = tmp_path or Path("/tmp/test_engine")
-    engine._storage     = mock_storage
-    engine._alpaca      = mock_alpaca
-    engine._av_client   = mock_av
-    engine._hmm         = hmm_map
-    engine._ou_signals  = ou_map
-    engine._llm         = MagicMock()
-    engine._mwu         = mwu_map
-    engine._risk        = mock_risk
-    engine._executor    = mock_executor
+    engine._tickers       = list(tickers)
+    engine._pairs         = [tuple(p) for p in pairs]
+    engine._paper         = True
+    engine._models_dir    = tmp_path or Path("/tmp/test_engine")
+    engine._storage       = mock_storage
+    engine._alpaca        = mock_alpaca
+    engine._av_client     = mock_av
+    engine._alpaca_news   = mock_alpaca_news
+    engine._fundamentals  = mock_fundamentals
+    engine._hmm           = hmm_map
+    engine._ou_signals    = ou_map
+    engine._llm           = MagicMock()
+    engine._mwu           = mwu_map
+    engine._risk          = mock_risk
+    engine._executor      = mock_executor
     engine._state_manager = mock_state
     engine._signal_stats  = {t: {"win_rate": 0.52, "avg_win": 0.015, "avg_loss": 0.010} for t in tickers}
     engine._shutdown_event = threading.Event()
@@ -362,9 +372,43 @@ class TestSentimentJob:
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
         engine._av_client.get_daily_call_count.return_value = 0
         engine.sentiment_job()
-        engine._llm.run_pipeline.assert_called_once_with(
-            engine._tickers, engine._av_client, engine._storage
-        )
+        engine._llm.run_pipeline.assert_called_once()
+        call_kwargs = engine._llm.run_pipeline.call_args
+        # positional: tickers, av_client, storage
+        assert call_kwargs.args[0] == engine._tickers
+        assert call_kwargs.args[1] is engine._av_client
+        assert call_kwargs.args[2] is engine._storage
+        # keyword: av_tickers and alpaca_client must be present
+        assert "av_tickers" in call_kwargs.kwargs
+        assert "alpaca_client" in call_kwargs.kwargs
+
+    def test_market_caps_fetched_in_sentiment_job(self, tmp_path):
+        """sentiment_job must call get_market_caps to rank tickers."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._av_client.get_daily_call_count.return_value = 0
+        engine.sentiment_job()
+        engine._fundamentals.get_market_caps.assert_called_once_with(engine._tickers)
+
+    def test_av_tickers_capped_at_30(self, tmp_path):
+        """When universe > 30, only the top 30 by cap go to AV."""
+        # Build engine with 35 tickers, each with a distinct cap
+        tickers_35 = [f"T{i:02d}" for i in range(35)]
+        engine, _, _, _ = _build_engine(tickers=tuple(tickers_35), pairs=(), tmp_path=tmp_path)
+        # Assign caps so T00 > T01 > ... > T34
+        caps = {t: float(35 - i) * 1e9 for i, t in enumerate(tickers_35)}
+        engine._fundamentals.get_market_caps.return_value = caps
+        engine._av_client.get_daily_call_count.return_value = 0
+
+        engine.sentiment_job()
+
+        call_kwargs = engine._llm.run_pipeline.call_args.kwargs
+        assert len(call_kwargs["av_tickers"]) == 30
+        # Top-cap tickers must be in av_tickers
+        assert "T00" in call_kwargs["av_tickers"]
+        assert "T29" in call_kwargs["av_tickers"]
+        # Bottom-cap tickers must NOT be in av_tickers
+        assert "T30" not in call_kwargs["av_tickers"]
+        assert "T34" not in call_kwargs["av_tickers"]
 
     def test_skipped_when_daily_budget_reached(self, tmp_path):
         """At 20 calls, sentiment_job must skip run_pipeline."""

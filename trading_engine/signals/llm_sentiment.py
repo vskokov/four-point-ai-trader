@@ -435,6 +435,9 @@ class LLMSentimentSignal:
         tickers: list[str],
         av_client: Any,
         storage: Any,
+        *,
+        av_tickers: list[str] | None = None,
+        alpaca_client: Any = None,
     ) -> list[dict[str, Any]]:
         """
         End-to-end pipeline: fetch → deduplicate → score → persist.
@@ -442,11 +445,18 @@ class LLMSentimentSignal:
         Parameters
         ----------
         tickers:
-            Equity symbols to process.
+            Equity symbols to process (all tickers, used for scoring loop).
         av_client:
             ``AlphaVantageNewsClient`` instance for news fetching.
         storage:
             ``Storage`` instance for persistence.
+        av_tickers:
+            Subset of *tickers* to fetch via AV.  When ``None`` (default),
+            all tickers are fetched via AV (original behaviour).  When
+            provided, remaining tickers are fetched via *alpaca_client*.
+        alpaca_client:
+            ``AlpacaNewsClient`` instance used as fallback for tickers not
+            in *av_tickers*.  Ignored when *av_tickers* is ``None``.
 
         Returns
         -------
@@ -454,10 +464,38 @@ class LLMSentimentSignal:
         """
         results: list[dict[str, Any]] = []
 
-        # 1. Single AV call for all tickers — 1 API call per pipeline run.
+        # Determine which tickers use AV vs Alpaca fallback.
+        _av_set = set(av_tickers) if av_tickers is not None else set(tickers)
+        _av_fetch_list = [t for t in tickers if t in _av_set] if av_tickers is not None else tickers
+        _alpaca_fetch_list = [t for t in tickers if t not in _av_set]
+
+        # 1. Single AV call for av_fetch_list — 1 API call per pipeline run.
         all_articles: list[dict[str, Any]] = av_client.fetch_news(
-            tickers, hours_back=self.hours_back
-        )
+            _av_fetch_list, hours_back=self.hours_back
+        ) if _av_fetch_list else []
+
+        # 1b. Alpaca fallback for remaining tickers.
+        if alpaca_client and _alpaca_fetch_list:
+            logger.info(
+                "llm.pipeline.alpaca_fallback",
+                n_tickers=len(_alpaca_fetch_list),
+            )
+            try:
+                alpaca_articles = alpaca_client.fetch_news(
+                    _alpaca_fetch_list, hours_back=self.hours_back
+                )
+                # Inject fields expected by score() and condensed_headlines.
+                for a in alpaca_articles:
+                    a.setdefault("relevance_score", 1.0)
+                    a.setdefault("av_sentiment_label", "")
+                    a.setdefault("av_sentiment_score", None)
+                all_articles.extend(alpaca_articles)
+            except Exception as exc:
+                logger.warning(
+                    "llm.pipeline.alpaca_fallback_failed",
+                    tickers=_alpaca_fetch_list,
+                    error=str(exc)[:120],
+                )
 
         # Group articles by ticker (each article dict has a "ticker" field).
         articles_by_ticker: dict[str, list[dict[str, Any]]] = {t: [] for t in tickers}

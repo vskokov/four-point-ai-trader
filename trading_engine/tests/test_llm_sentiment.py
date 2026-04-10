@@ -637,6 +637,138 @@ class TestRunPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Tests — run_pipeline with av_tickers / alpaca_client split
+# ---------------------------------------------------------------------------
+
+def _make_alpaca_article(title: str = "Alpaca news", ticker: str = "GILD") -> dict:
+    """Minimal Alpaca-style article (no av_sentiment_* fields)."""
+    h = hashlib.sha256(title.encode()).hexdigest()
+    return {
+        "ticker":        ticker,
+        "title":         title,
+        "summary":       "Some summary.",
+        "source":        "Bloomberg",
+        "published_at":  datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc),
+        "headline_hash": h,
+        # No relevance_score, av_sentiment_label, av_sentiment_score
+    }
+
+
+class TestRunPipelineSplit:
+    """run_pipeline with av_tickers + alpaca_client keyword args."""
+
+    def test_av_called_with_subset_only(self, sig: Any) -> None:
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [_make_article(ticker="AAPL")]
+        alpaca = MagicMock()
+        alpaca.fetch_news.return_value = []
+
+        sig.run_pipeline(
+            ["AAPL", "GILD"],
+            av, storage,
+            av_tickers=["AAPL"],
+            alpaca_client=alpaca,
+        )
+
+        # AV called with only "AAPL", not "GILD"
+        av.fetch_news.assert_called_once_with(["AAPL"], hours_back=sig.hours_back)
+        # Alpaca called with "GILD"
+        alpaca.fetch_news.assert_called_once_with(["GILD"], hours_back=sig.hours_back)
+
+    def test_alpaca_articles_get_relevance_score_injected(self, sig: Any) -> None:
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = []
+        alpaca = MagicMock()
+        alpaca_art = _make_alpaca_article(ticker="GILD")
+        alpaca.fetch_news.return_value = [alpaca_art]
+
+        sig.run_pipeline(
+            ["GILD"],
+            av, storage,
+            av_tickers=[],
+            alpaca_client=alpaca,
+        )
+
+        # Article should have been injected with relevance_score=1.0
+        assert alpaca_art["relevance_score"] == 1.0
+        assert alpaca_art["av_sentiment_label"] == ""
+        assert alpaca_art["av_sentiment_score"] is None
+
+    def test_alpaca_articles_scored_and_persisted(self, sig: Any) -> None:
+        _set_llm_response(sig, {**_VALID_LLM_RESPONSE, "ticker": "GILD"})
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = []
+        alpaca = MagicMock()
+        alpaca.fetch_news.return_value = [_make_alpaca_article(ticker="GILD")]
+
+        results = sig.run_pipeline(
+            ["GILD"],
+            av, storage,
+            av_tickers=[],
+            alpaca_client=alpaca,
+        )
+
+        assert len(storage.signal_rows) == 1
+        assert storage.signal_rows[0]["ticker"] == "GILD"
+        assert len(results) == 1
+
+    def test_no_alpaca_client_when_all_av(self, sig: Any) -> None:
+        """When av_tickers covers all tickers, alpaca_client is never called."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [_make_article(ticker="AAPL")]
+        alpaca = MagicMock()
+
+        sig.run_pipeline(
+            ["AAPL"],
+            av, storage,
+            av_tickers=["AAPL"],
+            alpaca_client=alpaca,
+        )
+
+        alpaca.fetch_news.assert_not_called()
+
+    def test_backward_compat_no_kwargs_uses_all_av(self, sig: Any) -> None:
+        """Existing callers without av_tickers still get all tickers via AV."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [_make_article(ticker="AAPL")]
+
+        sig.run_pipeline(["AAPL"], av, storage)
+
+        av.fetch_news.assert_called_once_with(["AAPL"], hours_back=sig.hours_back)
+
+    def test_alpaca_failure_logs_warning_and_continues(self, sig: Any) -> None:
+        """Alpaca fetch failure must not crash the pipeline."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [_make_article(ticker="AAPL")]
+        alpaca = MagicMock()
+        alpaca.fetch_news.side_effect = RuntimeError("Alpaca API down")
+
+        # Should not raise
+        results = sig.run_pipeline(
+            ["AAPL", "GILD"],
+            av, storage,
+            av_tickers=["AAPL"],
+            alpaca_client=alpaca,
+        )
+
+        # AAPL still scored from AV; GILD gets no_data due to alpaca failure
+        assert len(results) == 2
+        tickers_returned = {r["ticker"] for r in results}
+        assert tickers_returned == {"AAPL", "GILD"}
+
+
+# ---------------------------------------------------------------------------
 # Tests — run_if_market_hours
 # ---------------------------------------------------------------------------
 

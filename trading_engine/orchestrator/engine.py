@@ -30,7 +30,8 @@ from alpaca.trading.requests import MarketOrderRequest
 
 import trading_engine.config.settings as settings
 from trading_engine.data.alphavantage_client import AlphaVantageNewsClient
-from trading_engine.data.alpaca_client import AlpacaMarketData
+from trading_engine.data.alpaca_client import AlpacaMarketData, AlpacaNewsClient
+from trading_engine.data.fundamentals_client import FundamentalsClient
 from trading_engine.data.storage import Storage
 from trading_engine.execution.executor import OrderExecutor, RiskManager
 from trading_engine.meta_agent.mwu_agent import MWUMetaAgent
@@ -44,6 +45,11 @@ from trading_engine.utils.logging import get_logger, regime_banner
 logger = get_logger(__name__)
 
 _ET = ZoneInfo("America/New_York")
+
+# AV NEWS_SENTIMENT free tier accepts at most 50 tickers per request.
+# We reserve the top N by market cap for AV (richer per-ticker sentiment);
+# the remainder fall back to the Alpaca News API.
+_AV_MAX_TICKERS = 30
 
 # Default path for discovered pairs written by pair_scanner.py
 _DISCOVERED_PAIRS_PATH = Path(__file__).parent.parent / "config" / "discovered_pairs.json"
@@ -186,6 +192,8 @@ class TradingEngine:
         self._storage = Storage(settings.DB_URL)
         self._alpaca = AlpacaMarketData(self._storage)
         self._av_client = AlphaVantageNewsClient()
+        self._alpaca_news = AlpacaNewsClient()
+        self._fundamentals = FundamentalsClient()
 
         # ------------------------------------------------------------------
         # Signal modules  (one HMM + one MWU per ticker)
@@ -638,10 +646,29 @@ class TradingEngine:
             )
             return
 
-        logger.info("engine.sentiment_job.start", calls_today=count)
+        # Rank tickers by market cap. Top _AV_MAX_TICKERS use Alpha Vantage
+        # (pre-computed per-ticker sentiment, but capped at 50 tickers by AV).
+        # Remaining tickers fall back to the Alpaca News API.
+        caps = self._fundamentals.get_market_caps(self._tickers)
+        sorted_tickers = sorted(
+            self._tickers, key=lambda t: caps.get(t, 0.0), reverse=True
+        )
+        av_tickers = sorted_tickers[:_AV_MAX_TICKERS]
+        alpaca_tickers = sorted_tickers[_AV_MAX_TICKERS:]
+
+        logger.info(
+            "engine.sentiment_job.start",
+            calls_today=count,
+            n_av=len(av_tickers),
+            n_alpaca=len(alpaca_tickers),
+        )
         try:
             results = self._llm.run_pipeline(
-                self._tickers, self._av_client, self._storage
+                self._tickers,
+                self._av_client,
+                self._storage,
+                av_tickers=av_tickers,
+                alpaca_client=self._alpaca_news,
             )
             logger.info(
                 "engine.sentiment_job.done",

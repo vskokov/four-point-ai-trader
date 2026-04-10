@@ -587,3 +587,48 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     `max_size` dollar amount is capped at `cash`.  Tests that assert on `max_size` must
     set both `equity` and `cash` in the mock `account_info`; passing only `equity`
     (with `cash` absent or zero) will cause an unexpected `KeyError` or a zero cap.
+
+63. **`FundamentalsClient` uses parallel yfinance fetch (ThreadPoolExecutor, 10 workers)** —
+    first call for the full ticker universe can take 5–15 s; subsequent calls within 24 h
+    are instant (in-memory cache keyed by ticker with `fetched_at` timestamp).
+    Patch `trading_engine.data.fundamentals_client.yf.Ticker` (not the module-level
+    `yf`) in tests.  `side_effect` is needed when multiple tickers return different caps.
+
+64. **`sentiment_job` splits tickers by market cap** — top `_AV_MAX_TICKERS` (= 30) by
+    market cap go to Alpha Vantage (richer pre-computed sentiment); remaining tickers use
+    `AlpacaNewsClient` as fallback.  Alpaca articles have `relevance_score=1.0` injected
+    so they pass `LLMSentimentSignal.score`'s `min_relevance=0.3` filter.  AV still counts
+    as 1 call per pipeline run regardless of how many tickers are in the top-30 subset.
+
+---
+
+## TODO
+
+The following features are planned but not yet implemented.
+
+### yfinance extensions (via `FundamentalsClient`)
+
+These build on the `FundamentalsClient` class in `data/fundamentals_client.py` which
+already fetches market caps and caches results for 24 hours.
+
+**1. Earnings-date risk management**
+
+- Add `get_earnings_dates(tickers) -> dict[str, datetime | None]` to `FundamentalsClient`
+  using `yf.Ticker(t).calendar` or `yf.Ticker(t).earnings_dates`.
+- In `bar_handler` (or `sentiment_job`), if today or tomorrow is an earnings date for
+  the ticker, reduce position size (e.g. half Kelly) or skip order submission entirely.
+- Earnings events cause abnormal volatility that breaks HMM + OU signal assumptions.
+- Log `engine.earnings_guard.triggered` with ticker and earnings_date.
+
+**2. Analyst recommendations as an extra sentiment signal**
+
+- Add `get_analyst_recommendations(tickers) -> dict[str, str]` to `FundamentalsClient`
+  using `yf.Ticker(t).info["recommendationKey"]` (`strong_buy`, `buy`, `hold`,
+  `sell`, `strong_sell`).
+- Map to a [-1, 0, 1] signal: `strong_buy`/`buy` → +1, `hold` → 0,
+  `sell`/`strong_sell` → -1.
+- Add an `analyst_recs` entry to the `signals` dict in `bar_handler` alongside
+  `hmm_regime`, `ou_spread`, `llm_sentiment`.
+- Integrate into `MWUMetaAgent` as a 4th signal arm (weight matrix becomes 3×4).
+- This signal is orthogonal to news sentiment — analysts update ratings infrequently
+  (weekly/monthly) while LLM processes intraday headlines.
