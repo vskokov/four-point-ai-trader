@@ -51,6 +51,14 @@ _ET = ZoneInfo("America/New_York")
 # the remainder fall back to the Alpaca News API.
 _AV_MAX_TICKERS = 30
 
+
+def _to_float(value: Any) -> float | None:
+    """Cast numpy scalars (or None) to plain Python float for psycopg2 binding."""
+    if value is None:
+        return None
+    return float(value)
+
+
 # Default path for discovered pairs written by pair_scanner.py
 _DISCOVERED_PAIRS_PATH = Path(__file__).parent.parent / "config" / "discovered_pairs.json"
 
@@ -568,7 +576,7 @@ class TradingEngine:
                     "time":                   datetime.now(tz=timezone.utc),
                     "ticker":                 ticker,
                     "final_signal":           final_signal,
-                    "score":                  decision["score"],
+                    "score":                  float(decision["score"]),
                     "regime":                 regime,
                     "regime_label":           regime_label,
                     "regime_probs":           regime_probs,
@@ -576,8 +584,8 @@ class TradingEngine:
                     "hmm_confidence":         float(hmm_signal["confidence"]),
                     "ou_signal":              int(ou_signal.get("signal", 0)),
                     "ou_confidence":          float(ou_signal.get("confidence", 0.0)),
-                    "ou_zscore":              ou_signal.get("z_score"),
-                    "ou_spread_value":        ou_signal.get("spread_value"),
+                    "ou_zscore":              _to_float(ou_signal.get("z_score")),
+                    "ou_spread_value":        _to_float(ou_signal.get("spread_value")),
                     "ou_pair":                ou_signal.get("pair"),
                     "llm_signal":             int(llm_signal.get("signal", 0)),
                     "llm_confidence":         float(llm_signal.get("confidence", 0.0)),
