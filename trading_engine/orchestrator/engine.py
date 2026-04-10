@@ -647,12 +647,26 @@ class TradingEngine:
             return
 
         # Rank tickers by market cap. Top _AV_MAX_TICKERS use Alpha Vantage
-        # (pre-computed per-ticker sentiment, but capped at 50 tickers by AV).
+        # (pre-computed per-ticker sentiment, capped at 50 tickers by AV free tier).
         # Remaining tickers fall back to the Alpaca News API.
-        caps = self._fundamentals.get_market_caps(self._tickers)
-        sorted_tickers = sorted(
-            self._tickers, key=lambda t: caps.get(t, 0.0), reverse=True
-        )
+        # If yfinance is unavailable, fall back to original list order but still
+        # hard-cap at _AV_MAX_TICKERS so we never exceed the AV parameter limit.
+        try:
+            caps = self._fundamentals.get_market_caps(self._tickers)
+            sorted_tickers = sorted(
+                self._tickers, key=lambda t: caps.get(t, 0.0), reverse=True
+            )
+        except Exception as exc:
+            logger.warning(
+                "engine.sentiment_job.cap_fetch_failed",
+                error=str(exc),
+                hint="falling back to original ticker order",
+            )
+            sorted_tickers = list(self._tickers)
+
+        # Hard cap: never send more than _AV_MAX_TICKERS to AV regardless of how
+        # many tickers are in the universe (AV free tier rejects >50 with
+        # "Invalid inputs").
         av_tickers = sorted_tickers[:_AV_MAX_TICKERS]
         alpaca_tickers = sorted_tickers[_AV_MAX_TICKERS:]
 
@@ -661,6 +675,7 @@ class TradingEngine:
             calls_today=count,
             n_av=len(av_tickers),
             n_alpaca=len(alpaca_tickers),
+            av_tickers=av_tickers,
         )
         try:
             results = self._llm.run_pipeline(
