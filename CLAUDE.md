@@ -21,6 +21,7 @@ All runnable code lives under `trading_engine/`.
 | **6 — Portfolio** | PortfolioOptimizer (Black-Litterman + Min-Variance, LedoitWolf, daily rebalance job) | **Complete** |
 | **7 — Pair discovery** | Standalone pair scanner, JSON-driven pair loading, log-return correlation pre-filter | **Complete** |
 | **8 — Market-open guard** | Alpaca clock API (`is_market_open`), 60 s cache, three order-path guards | **Complete** |
+| **11 — News routing** | `FundamentalsClient` (yfinance, 24 h cap cache); top-30 by market cap → AV; remaining → Alpaca News; connectivity check scripts | **Complete** |
 
 ---
 
@@ -619,6 +620,41 @@ already fetches market caps and caches results for 24 hours.
   the ticker, reduce position size (e.g. half Kelly) or skip order submission entirely.
 - Earnings events cause abnormal volatility that breaks HMM + OU signal assumptions.
 - Log `engine.earnings_guard.triggered` with ticker and earnings_date.
+
+**3. Local news fallback window ("most-recent-N" guarantee)**
+
+- **Problem:** with `hours_back=2`, quiet tickers (weekends, off-hours, low-coverage
+  names like IONQ or QUBT) often return 0 articles. The LLM then gets no input and
+  outputs a neutral fallback — which is correct but wastes the scoring slot.
+- **Solution:** after the live fetch (AV + Alpaca), for any ticker that still has
+  0 *new* articles (not yet in `_seen_hashes`), query the local `news` table
+  for the **2 most recent stored articles** for that ticker, regardless of age.
+  These act as context even if they are days old.
+- **Key constraint:** this fallback must be implemented in **`run_pipeline`**
+  (or a helper called by it), NOT by widening the `hours_back` parameter passed
+  to AV or Alpaca — that would waste API quota fetching a large historical window.
+  The DB query is free.
+- **Implementation sketch:**
+  - In `run_pipeline`, after building `articles_by_ticker`, for each ticker where
+    `len(new_articles) == 0`: call `storage.query_news(ticker, limit=2)` (new
+    helper method on `Storage`).
+  - Mark fallback articles with `"source": "local_cache"` so the dashboard can
+    distinguish them.
+  - Fallback articles must still pass through `_seen_hashes` dedup — skip any
+    already scored this session.
+  - Log `llm.pipeline.local_fallback` with ticker and n_fallback.
+  - The `_human_age` function already handles old pub dates gracefully (shows
+    "[3 days 2 hours ago]") — the LLM prompt already instructs it to weight
+    recent news more heavily, so stale fallback articles have reduced influence
+    naturally.
+- **New Storage method needed:** `query_news(ticker, limit=2) -> list[dict]`
+  — `SELECT headline_hash, title, summary, source, fetched_at FROM news WHERE
+  ticker = :ticker ORDER BY fetched_at DESC LIMIT :limit`. Returns dicts in the
+  same shape as `AlphaVantageNewsClient._parse_feed` output so `score()` works
+  unchanged. Add `relevance_score=0.5` (neutral, lower than AV's 1.0 but above
+  the `min_relevance=0.3` filter).
+- **Tests to add:** `TestRunPipeline::test_local_fallback_used_when_no_live_articles`,
+  `test_local_fallback_skips_seen_hashes`, `test_no_fallback_when_live_articles_present`.
 
 **2. Analyst recommendations as an extra sentiment signal**
 
