@@ -554,7 +554,7 @@ class AlpacaNewsClient:
         seen_hashes: set[str] = set()
         rows: list[dict[str, Any]] = []
 
-        for article in news_set.news:
+        for article in news_set.data.get("news", []):
             # Assign ticker: first symbol in the article that we requested.
             matched = [s for s in (article.symbols or []) if s in ticker_set]
             if not matched:

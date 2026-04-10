@@ -547,7 +547,7 @@ class TestAlpacaNewsClient:
 
     def _make_news_set(self, articles: list) -> MagicMock:
         ns = MagicMock()
-        ns.news = articles
+        ns.data = {"news": articles}
         return ns
 
     def test_returns_list_of_dicts(self, mock_settings):
