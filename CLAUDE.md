@@ -601,6 +601,14 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     so they pass `LLMSentimentSignal.score`'s `min_relevance=0.3` filter.  AV still counts
     as 1 call per pipeline run regardless of how many tickers are in the top-30 subset.
 
+65. **`np.float64` / numpy scalar types crash psycopg2** — `MWUMetaAgent.decide()` returns
+    `score` as `np.float64`; `OUSpreadSignal.compute_signal()` returns `z_score` and
+    `spread_value` as numpy floats.  psycopg2 cannot bind these — it serializes them as
+    `np.float64(value)` which it then parses as schema `np`, raising
+    `psycopg2.errors.InvalidSchemaName`.  Always cast to plain Python types before passing
+    to any `Storage` method: `float(decision["score"])` for the score, `_to_float(v)` (a
+    `None`-safe helper) for nullable OU fields.  The helper lives in `orchestrator/engine.py`.
+
 ---
 
 ## TODO
