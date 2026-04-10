@@ -112,11 +112,15 @@ def main() -> int:
     try:
         ticker_obj = yf.Ticker("AAPL")
         cal = ticker_obj.calendar
-        if cal is not None and not cal.empty:
+        if cal:
             _ok("Calendar fetched")
-            print(cal.to_string())
+            if isinstance(cal, dict):
+                for k, v in cal.items():
+                    print(f"       {k}: {v}")
+            else:
+                print(cal)
         else:
-            _warn("Calendar returned None or empty — may be unavailable for this ticker.")
+            _warn("Calendar returned empty — may be unavailable for this ticker.")
     except Exception as exc:
         _warn(f"Calendar fetch raised: {exc}")
 
