@@ -186,9 +186,9 @@ def _load_portfolio_history(period: str, timeframe_str: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def _load_todays_orders() -> pd.DataFrame:
+def _load_orders(days_back: int = 1) -> pd.DataFrame:
     """
-    Load all of today's orders from Alpaca.
+    Load orders from the last *days_back* days from Alpaca.
 
     Returns a DataFrame with columns: symbol, side, status, qty,
     filled_qty, filled_avg_price, submitted_at, filled_at.
@@ -196,19 +196,18 @@ def _load_todays_orders() -> pd.DataFrame:
     """
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
+    from datetime import timedelta
 
     client = _get_alpaca_client()
     if client is None:
         return pd.DataFrame()
 
-    today_midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    after = datetime.now(timezone.utc) - timedelta(days=days_back)
     try:
         orders = client.get_orders(
             GetOrdersRequest(
                 status=QueryOrderStatus.ALL,
-                after=today_midnight,
+                after=after,
                 limit=500,
             )
         )
@@ -308,6 +307,7 @@ def _render_equity_chart(
     history_df: pd.DataFrame,
     trades_df: pd.DataFrame,
     period_label: str,
+    orders_df: pd.DataFrame,
 ) -> None:
     if history_df.empty:
         st.info("Portfolio history unavailable. Check Alpaca credentials.")
@@ -349,6 +349,13 @@ def _render_equity_chart(
         # Keep timezone by using a list of Timestamps rather than .values
         # (.values strips tz → tz-naive datetime64, causing subtract errors)
         in_range["_t"] = t_col[mask].tolist()
+
+        # Only show markers for decisions that produced an actual Alpaca order.
+        if not orders_df.empty:
+            submitted_mask = in_range.apply(
+                lambda r: _find_order(r, orders_df) is not None, axis=1
+            )
+            in_range = in_range[submitted_mask]
 
         def _nearest_equity(t: pd.Timestamp) -> float:
             ts = pd.Timestamp(t)
@@ -664,10 +671,15 @@ def main() -> None:
 
     period, timeframe_str = _CHART_PERIOD_MAP[period_label]
 
+    # Extend the orders lookback to cover the selected chart period so that
+    # markers for older bars can be matched to actual submitted orders.
+    _PERIOD_DAYS = {"Today (1D)": 2, "1 Week": 8, "1 Month": 32}
+    orders_days_back = _PERIOD_DAYS.get(period_label, 2)
+
     # ---- Load all data ----
     acct       = _load_account_info()
     history_df = _load_portfolio_history(period, timeframe_str)
-    orders_df  = _load_todays_orders()
+    orders_df  = _load_orders(orders_days_back)
 
     try:
         trades_df = _load_trades(limit)
@@ -682,7 +694,7 @@ def main() -> None:
     st.divider()
 
     # ---- Equity chart ----
-    _render_equity_chart(history_df, chart_trades_df, period_label)
+    _render_equity_chart(history_df, chart_trades_df, period_label, orders_df)
 
     st.divider()
 
