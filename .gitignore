@@ -21,6 +21,10 @@ trading_engine/config/av_rate_state.json
 # Discovered pairs (local scan output — regenerate with pair_scanner.py)
 trading_engine/config/discovered_pairs.json
 
+# Log files
+*.log.json
+trader.log.json
+
 # IDE
 .idea/
 .vscode/
