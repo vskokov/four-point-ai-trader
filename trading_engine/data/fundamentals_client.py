@@ -1,13 +1,10 @@
 """
 Fundamentals data client using yfinance.
 
-Provides market-cap and other company fundamentals for ticker screening.
-Used by the sentiment pipeline to rank tickers by size so the AV API quota
-(top N by market cap via AV) and the Alpaca fallback (remaining tickers)
-are allocated optimally.
+Provides market-cap and other company fundamentals for ticker screening,
+and upcoming earnings dates for the earnings-date risk guard in bar_handler.
 
 Planned additions (TODO):
-  - earnings_dates(tickers)    — pause/reduce positions around earnings events
   - analyst_recommendations()  — additional orthogonal sentiment signal
 """
 
@@ -38,6 +35,8 @@ class FundamentalsClient:
     def __init__(self) -> None:
         # ticker → {"value": float, "fetched_at": datetime}
         self._cache: dict[str, dict[str, Any]] = {}
+        # ticker → {"value": datetime | None, "fetched_at": datetime}
+        self._earnings_cache: dict[str, dict[str, Any]] = {}
         logger.info("fundamentals_client.init")
 
     # ------------------------------------------------------------------
@@ -116,5 +115,115 @@ class FundamentalsClient:
             for future in as_completed(futures):
                 ticker, cap = future.result()
                 result[ticker] = cap
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Earnings dates
+    # ------------------------------------------------------------------
+
+    def get_earnings_dates(self, tickers: list[str]) -> dict[str, datetime | None]:
+        """
+        Return the next upcoming earnings date (UTC) for each ticker, or
+        ``None`` if unknown.
+
+        Results are cached in-process for 24 hours.  Only tickers with a
+        stale or absent cache entry trigger network calls.
+
+        Parameters
+        ----------
+        tickers:
+            Equity symbols, e.g. ``["AAPL", "NVDA"]``.
+
+        Returns
+        -------
+        dict[str, datetime | None]
+            ``{ticker: next_earnings_utc}`` — ``None`` when no upcoming
+            earnings date is available.
+        """
+        if not tickers:
+            return {}
+
+        now = datetime.now(tz=timezone.utc)
+        result: dict[str, datetime | None] = {}
+        to_fetch: list[str] = []
+
+        for t in tickers:
+            entry = self._earnings_cache.get(t)
+            if entry and (now - entry["fetched_at"]).total_seconds() < _CACHE_TTL_SECONDS:
+                result[t] = entry["value"]
+            else:
+                to_fetch.append(t)
+
+        if to_fetch:
+            logger.info(
+                "fundamentals_client.earnings_date.fetch",
+                n_tickers=len(to_fetch),
+                tickers=to_fetch,
+            )
+            fetched = self._fetch_earnings_dates_parallel(to_fetch)
+            for t, dt in fetched.items():
+                result[t] = dt
+                self._earnings_cache[t] = {"value": dt, "fetched_at": now}
+
+        return result
+
+    def _fetch_earnings_dates_parallel(
+        self, tickers: list[str]
+    ) -> dict[str, datetime | None]:
+        """Fetch the next upcoming earnings date for each ticker in parallel."""
+        result: dict[str, datetime | None] = {}
+
+        def _fetch_one(ticker: str) -> tuple[str, datetime | None]:
+            try:
+                cal = yf.Ticker(ticker).calendar
+                if not cal:
+                    return ticker, None
+
+                raw = cal.get("Earnings Date")
+                if raw is None:
+                    return ticker, None
+
+                # Normalise to a flat list of objects with a .date() method.
+                if not isinstance(raw, list):
+                    raw = [raw]
+
+                today = datetime.now(tz=timezone.utc).date()
+                future_dates: list[datetime] = []
+                for d in raw:
+                    try:
+                        # yfinance returns pd.Timestamp (tz-naive or tz-aware).
+                        # Convert to UTC-aware Python datetime.
+                        if hasattr(d, "tzinfo"):
+                            # pd.Timestamp — attach UTC if tz-naive
+                            if d.tzinfo is None:
+                                dt = d.tz_localize("UTC").to_pydatetime()
+                            else:
+                                dt = d.tz_convert("UTC").to_pydatetime()
+                        else:
+                            # Bare date / string fallback
+                            dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                        if dt.date() >= today:
+                            future_dates.append(dt)
+                    except Exception:
+                        continue
+
+                if not future_dates:
+                    return ticker, None
+                return ticker, min(future_dates)
+
+            except Exception as exc:
+                logger.warning(
+                    "fundamentals_client.earnings_date.error",
+                    ticker=ticker,
+                    exc=str(exc)[:120],
+                )
+                return ticker, None
+
+        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as executor:
+            futures = {executor.submit(_fetch_one, t): t for t in tickers}
+            for future in as_completed(futures):
+                ticker, dt = future.result()
+                result[ticker] = dt
 
         return result

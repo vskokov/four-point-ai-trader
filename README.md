@@ -32,7 +32,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 
 | Layer | Capability |
 |---|---|
-| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking with 24 h cache |
+| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking and earnings dates with 24 h cache |
 | **Pair discovery** | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON |
 | **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
 | **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
@@ -351,7 +351,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 450 tests, no live connections required
+# Unit tests — 449 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -380,12 +380,12 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
 | `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 87 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing |
+| `test_engine.py` | 98 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
-| `test_fundamentals_client.py` | 9 | FundamentalsClient market cap fetch, 24 h cache |
+| `test_fundamentals_client.py` | 19 | FundamentalsClient market cap fetch, 24 h cache; earnings date fetch, 24 h cache |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **450** | |
+| **Total (unit)** | **449** | |
 
 ---
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 _MOD = "trading_engine.data.fundamentals_client"
@@ -121,3 +122,108 @@ class TestCaching:
             second = client.get_market_caps(["GILD"])
         assert first["GILD"] == pytest.approx(5e11)
         assert second["GILD"] == pytest.approx(5e11)
+
+
+# ===========================================================================
+# get_earnings_dates
+# ===========================================================================
+
+def _mock_yf_ticker_earnings(earnings_date):
+    """
+    Return a yf.Ticker mock whose .calendar returns the given earnings date(s).
+    earnings_date may be a pd.Timestamp, list of pd.Timestamps, or None.
+    """
+    m = MagicMock()
+    if earnings_date is None:
+        m.calendar = {}
+    elif isinstance(earnings_date, list):
+        m.calendar = {"Earnings Date": earnings_date}
+    else:
+        m.calendar = {"Earnings Date": [earnings_date]}
+    return m
+
+
+class TestGetEarningsDates:
+
+    def test_returns_future_earnings_date(self):
+        future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=10)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(future)):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"] is not None
+        assert result["AAPL"].date() == future.date()
+
+    def test_returns_none_when_calendar_empty(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(None)):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"] is None
+
+    def test_returns_none_for_past_date_only(self):
+        past = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=5)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(past)):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"] is None
+
+    def test_returns_soonest_when_multiple_future_dates(self):
+        sooner = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=5)
+        later  = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=10)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings([sooner, later])):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"].date() == sooner.date()
+
+    def test_ignores_past_and_returns_earliest_future(self):
+        past   = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=3)
+        future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=7)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings([past, future])):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"].date() == future.date()
+
+    def test_returns_none_on_exception(self):
+        def _bad(_ticker):
+            raise RuntimeError("network error")
+
+        with patch(f"{_MOD}.yf.Ticker", side_effect=_bad):
+            client = _make_client()
+            result = client.get_earnings_dates(["AAPL"])
+        assert result["AAPL"] is None
+
+    def test_empty_ticker_list_returns_empty_dict(self):
+        with patch(f"{_MOD}.yf.Ticker") as mock_ticker:
+            client = _make_client()
+            result = client.get_earnings_dates([])
+        assert result == {}
+        mock_ticker.assert_not_called()
+
+    def test_second_call_uses_cache(self):
+        future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=10)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(future)) as mock_ticker:
+            client = _make_client()
+            client.get_earnings_dates(["AAPL"])
+            client.get_earnings_dates(["AAPL"])   # should hit cache
+        assert mock_ticker.call_count == 1
+
+    def test_stale_earnings_cache_refetches(self):
+        future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=10)
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(future)) as mock_ticker:
+            client = _make_client()
+            client.get_earnings_dates(["AAPL"])
+
+            stale_time = datetime.now(tz=timezone.utc) - timedelta(hours=25)
+            client._earnings_cache["AAPL"]["fetched_at"] = stale_time
+
+            client.get_earnings_dates(["AAPL"])
+
+        assert mock_ticker.call_count == 2
+
+    def test_handles_tz_naive_timestamp(self):
+        # yfinance sometimes returns tz-naive Timestamps
+        future_naive = pd.Timestamp.now() + pd.Timedelta(days=5)  # no tz
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_earnings(future_naive)):
+            client = _make_client()
+            result = client.get_earnings_dates(["MSFT"])
+        # Should still return a valid datetime (tz-naive attached UTC)
+        assert result["MSFT"] is not None

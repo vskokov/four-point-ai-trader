@@ -490,6 +490,36 @@ class TradingEngine:
             "contributing_headlines":  headlines,
         }
 
+    def _is_earnings_guard_triggered(self, ticker: str) -> bool:
+        """
+        Return ``True`` if today or tomorrow is an earnings date for *ticker*.
+
+        Calls ``FundamentalsClient.get_earnings_dates`` which caches results for
+        24 hours — the first call per day may hit yfinance; subsequent calls are
+        instant dict lookups.  On any exception the guard fails **open** (returns
+        ``False``) so a data fetch failure never blocks trading.
+        """
+        try:
+            dates = self._fundamentals.get_earnings_dates([ticker])
+            earnings_dt = dates.get(ticker)
+            if earnings_dt is None:
+                return False
+            today = datetime.now(tz=timezone.utc).date()
+            tomorrow = today + timedelta(days=1)
+            earnings_date = (
+                earnings_dt.date()
+                if hasattr(earnings_dt, "date")
+                else earnings_dt
+            )
+            return earnings_date in (today, tomorrow)
+        except Exception as exc:
+            logger.warning(
+                "engine.earnings_guard.check_failed",
+                ticker=ticker,
+                error=str(exc),
+            )
+            return False  # fail open — don't block trades on guard failure
+
     def _get_ou_signal_for_ticker(self, ticker: str) -> dict[str, Any]:
         """
         Return the OU spread signal for the first pair that contains *ticker*.
@@ -697,7 +727,17 @@ class TradingEngine:
             except Exception as exc:
                 logger.warning("engine.trade_log_failed", ticker=ticker, error=str(exc))
 
-            if not self._alpaca.is_market_open():
+            # Earnings guard: skip order submission on earnings day or the day before.
+            # The decision is still logged to trade_log (above) for audit purposes.
+            if self._is_earnings_guard_triggered(ticker):
+                earnings_dates = self._fundamentals.get_earnings_dates([ticker])
+                earnings_dt = earnings_dates.get(ticker)
+                logger.info(
+                    "engine.earnings_guard.triggered",
+                    ticker=ticker,
+                    earnings_date=str(earnings_dt.date()) if earnings_dt else None,
+                )
+            elif not self._alpaca.is_market_open():
                 logger.debug(
                     "engine.bar_handler.order_skipped_market_closed", ticker=ticker
                 )

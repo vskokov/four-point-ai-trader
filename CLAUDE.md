@@ -71,7 +71,7 @@ trading_engine/
 │   │   └── test_executor.py         # Unit tests — fully mocked (41 tests)
 │   ├── portfolio/
 │   │   └── test_portfolio_optimizer.py  # Unit tests — fully mocked (9 tests)
-│   └── test_engine.py               # Unit tests — fully mocked (87 tests)
+│   └── test_engine.py               # Unit tests — fully mocked (98 tests)
 ├── conftest.py              # Adds repo root to sys.path for pytest
 ├── requirements.txt
 ├── docker-compose.yml       # TimescaleDB container
@@ -144,11 +144,12 @@ no separate migration step needed.
 ```bash
 cd trading_engine
 
-# Unit tests only — no DB or network required (450 tests across 9 files)
+# Unit tests only — no DB or network required (449 tests across 10 files)
 .venv/bin/pytest tests/test_alpaca_client.py tests/test_alphavantage_client.py \
     tests/test_hmm_regime.py tests/test_mean_reversion.py tests/test_llm_sentiment.py \
     tests/backtesting/test_backtest_engine.py tests/meta_agent/test_mwu_agent.py \
-    tests/execution/test_executor.py tests/test_engine.py tests/portfolio/ -v
+    tests/execution/test_executor.py tests/test_engine.py tests/portfolio/ \
+    tests/test_fundamentals_client.py -v
 
 # Integration tests — require live TimescaleDB
 TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
@@ -618,6 +619,19 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     to any `Storage` method: `float(decision["score"])` for the score, `_to_float(v)` (a
     `None`-safe helper) for nullable OU fields.  The helper lives in `orchestrator/engine.py`.
 
+67. **Earnings guard fails open — yfinance outage must not block orders** —
+    `_is_earnings_guard_triggered` wraps the entire `FundamentalsClient.get_earnings_dates`
+    call in `try/except` and returns `False` on any exception.  The guard is a
+    risk-reduction measure, not a hard gating requirement — a data fetch failure should
+    never prevent the engine from trading.  Tests must verify this by checking
+    `submit_order` is still called when `get_earnings_dates` raises.
+
+68. **Earnings cache is separate from the market-cap cache** — `FundamentalsClient` uses
+    `self._earnings_cache` (distinct from `self._cache` for market caps), both keyed by
+    ticker with 24-hour TTL.  The separation prevents a market-cap re-fetch from
+    accidentally invalidating (or polluting) the earnings data.  Tests that assert on
+    `yf.Ticker` call counts must be aware both methods may call `yf.Ticker` independently.
+
 ---
 
 ## TODO
@@ -629,14 +643,19 @@ The following features are planned but not yet implemented.
 These build on the `FundamentalsClient` class in `data/fundamentals_client.py` which
 already fetches market caps and caches results for 24 hours.
 
-**1. Earnings-date risk management**
+**1. Earnings-date risk management — COMPLETE**
 
-- Add `get_earnings_dates(tickers) -> dict[str, datetime | None]` to `FundamentalsClient`
-  using `yf.Ticker(t).calendar` or `yf.Ticker(t).earnings_dates`.
-- In `bar_handler` (or `sentiment_job`), if today or tomorrow is an earnings date for
-  the ticker, reduce position size (e.g. half Kelly) or skip order submission entirely.
-- Earnings events cause abnormal volatility that breaks HMM + OU signal assumptions.
-- Log `engine.earnings_guard.triggered` with ticker and earnings_date.
+- `FundamentalsClient.get_earnings_dates(tickers)` added: fetches next upcoming date
+  per ticker via `yf.Ticker(t).calendar["Earnings Date"]`; 24 h in-process cache;
+  parallel fetch (10 workers); returns `datetime | None` in UTC.
+- `TradingEngine._is_earnings_guard_triggered(ticker)`: returns `True` when today or
+  tomorrow is an earnings date; fails open (returns `False`) on any exception so a
+  yfinance outage never blocks trading.
+- `bar_handler`: if guard fires, logs `engine.earnings_guard.triggered` with ticker
+  and earnings_date, skips order submission.  The `trade_log` entry is still written
+  (full decision snapshot preserved for the dashboard).
+- 10 new tests in `TestGetEarningsDates` (test_fundamentals_client.py) and 11 new tests
+  in `TestEarningsGuard` (test_engine.py).
 
 **3. Local news fallback window ("most-recent-N" guarantee)**
 

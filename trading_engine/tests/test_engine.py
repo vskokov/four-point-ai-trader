@@ -1811,3 +1811,109 @@ class TestStartupChecksSeeding:
                 models=[SimpleNamespace(model="gemma4:e4b")]
             )
             engine.startup_checks()   # must not raise
+
+
+# ===========================================================================
+# Earnings guard
+# ===========================================================================
+
+class TestEarningsGuard:
+    """
+    _is_earnings_guard_triggered() returns True only when today or tomorrow is
+    an earnings date for the ticker.  bar_handler skips order submission (but
+    still persists the trade_log entry) when the guard fires.
+    """
+
+    def _engine_with_signal(self, tmp_path, earnings_date):
+        """Build an engine that produces a BUY signal, with market open."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path,
+            mwu_decision=_mwu_decision(signal=1, score=0.8),
+        )
+        mock_alpaca.is_market_open.return_value = True
+        engine._fundamentals.get_earnings_dates.return_value = {
+            "AAPL": earnings_date
+        }
+        return engine, mock_alpaca
+
+    # ------------------------------------------------------------------
+    # _is_earnings_guard_triggered unit tests
+    # ------------------------------------------------------------------
+
+    def test_triggered_when_earnings_today(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        today_dt = datetime.now(tz=timezone.utc)
+        engine._fundamentals.get_earnings_dates.return_value = {"AAPL": today_dt}
+
+        assert engine._is_earnings_guard_triggered("AAPL") is True
+
+    def test_triggered_when_earnings_tomorrow(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        tomorrow_dt = datetime.now(tz=timezone.utc) + timedelta(days=1)
+        engine._fundamentals.get_earnings_dates.return_value = {"AAPL": tomorrow_dt}
+
+        assert engine._is_earnings_guard_triggered("AAPL") is True
+
+    def test_not_triggered_when_earnings_in_two_days(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        future_dt = datetime.now(tz=timezone.utc) + timedelta(days=2)
+        engine._fundamentals.get_earnings_dates.return_value = {"AAPL": future_dt}
+
+        assert engine._is_earnings_guard_triggered("AAPL") is False
+
+    def test_not_triggered_when_no_earnings_date(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_earnings_dates.return_value = {"AAPL": None}
+
+        assert engine._is_earnings_guard_triggered("AAPL") is False
+
+    def test_fails_open_on_exception(self, tmp_path):
+        """A crash in get_earnings_dates must not block order submission."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_earnings_dates.side_effect = RuntimeError("yfinance down")
+
+        assert engine._is_earnings_guard_triggered("AAPL") is False
+
+    # ------------------------------------------------------------------
+    # bar_handler integration: order skipped when guard fires
+    # ------------------------------------------------------------------
+
+    def test_order_skipped_on_earnings_day(self, tmp_path):
+        engine, mock_alpaca = self._engine_with_signal(
+            tmp_path, datetime.now(tz=timezone.utc)
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_not_called()
+
+    def test_order_skipped_on_earnings_eve(self, tmp_path):
+        engine, mock_alpaca = self._engine_with_signal(
+            tmp_path, datetime.now(tz=timezone.utc) + timedelta(days=1)
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_not_called()
+
+    def test_trade_log_still_written_when_guard_fires(self, tmp_path):
+        """The decision must be persisted even when the order is skipped."""
+        engine, _ = self._engine_with_signal(
+            tmp_path, datetime.now(tz=timezone.utc)
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._storage.insert_trade_log.assert_called_once()
+
+    def test_order_proceeds_when_no_earnings(self, tmp_path):
+        """When no earnings date is imminent, order submission runs normally."""
+        engine, mock_alpaca = self._engine_with_signal(tmp_path, None)
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_called_once()
+
+    def test_order_proceeds_when_earnings_two_days_out(self, tmp_path):
+        engine, mock_alpaca = self._engine_with_signal(
+            tmp_path, datetime.now(tz=timezone.utc) + timedelta(days=2)
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_called_once()
