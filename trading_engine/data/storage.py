@@ -101,9 +101,19 @@ CREATE TABLE IF NOT EXISTS trade_log (
     ou_pair                 TEXT,
     llm_signal              INT,
     llm_confidence          FLOAT,
+    analyst_signal          INT,
+    analyst_confidence      FLOAT,
     mwu_weights             JSONB,
     contributing_headlines  JSONB
 );
+"""
+
+# Migration: add analyst columns to existing trade_log tables that predate them.
+# ADD COLUMN IF NOT EXISTS is a no-op when the column already exists.
+_DDL_TRADE_LOG_ADD_ANALYST = """
+ALTER TABLE trade_log
+    ADD COLUMN IF NOT EXISTS analyst_signal     INT,
+    ADD COLUMN IF NOT EXISTS analyst_confidence FLOAT;
 """
 
 
@@ -157,6 +167,7 @@ class Storage:
             conn.execute(text(_DDL_REGIME_LOG))
             conn.execute(text(_DDL_REGIME_LOG_HYPERTABLE))
             conn.execute(text(_DDL_TRADE_LOG))
+            conn.execute(text(_DDL_TRADE_LOG_ADD_ANALYST))
         logger.info("storage.bootstrap", status="done")
 
     # ------------------------------------------------------------------
@@ -425,6 +436,7 @@ class Storage:
                 hmm_signal, hmm_confidence,
                 ou_signal, ou_confidence, ou_zscore, ou_spread_value, ou_pair,
                 llm_signal, llm_confidence,
+                analyst_signal, analyst_confidence,
                 mwu_weights, contributing_headlines
             ) VALUES (
                 :time, :ticker, :final_signal, :score,
@@ -432,6 +444,7 @@ class Storage:
                 :hmm_signal, :hmm_confidence,
                 :ou_signal, :ou_confidence, :ou_zscore, :ou_spread_value, :ou_pair,
                 :llm_signal, :llm_confidence,
+                :analyst_signal, :analyst_confidence,
                 :mwu_weights, :contributing_headlines
             )
             """
@@ -460,6 +473,7 @@ class Storage:
                    hmm_signal, hmm_confidence,
                    ou_signal, ou_confidence, ou_zscore, ou_spread_value, ou_pair,
                    llm_signal, llm_confidence,
+                   analyst_signal, analyst_confidence,
                    mwu_weights, contributing_headlines
             FROM   trade_log
             ORDER  BY time DESC

@@ -18,7 +18,8 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
   APScheduler ────────────┤    ├─► HMMRegimeDetector                        │
     sentiment (25/35 min)  │    ├─► KalmanHedgeRatio + OUSpreadSignal        │
     market_open (09:31 ET) │    ├─► LLM signal (from signal_log)            │
-    eod_job (16:05 ET)     │    └─► MWUMetaAgent.scheduled_update()         │
+    eod_job (16:05 ET)     │    ├─► Analyst recs (yfinance, 24 h cache)     │
+                          │    └─► MWUMetaAgent.scheduled_update()         │
                           │              │                                   │
                           │              └─► OrderExecutor                  │
                           │                    RiskManager (Kelly + CBs)    │
@@ -32,7 +33,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 
 | Layer | Capability |
 |---|---|
-| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking and earnings dates with 24 h cache |
+| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news, trade decisions; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking, earnings dates, and analyst recommendations with 24 h cache |
 | **Pair discovery** | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON |
 | **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
 | **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
@@ -43,7 +44,8 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 | **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
 | **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes |
 | **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
-| **Dashboard** | Standalone Streamlit app (`dashboard/app.py`); displays last 25/50/100 trades with HMM regime probabilities, OU spread details, LLM sentiment, MWU weights, and collapsible news headlines; auto-refreshes every 60 s |
+| **Dashboard** | Standalone Streamlit app (`dashboard/app.py`); displays last 25/50/100 trades with HMM regime probabilities, OU spread details, LLM sentiment, analyst recommendation, MWU weights, and collapsible news headlines; auto-refreshes every 60 s |
+| **Decision quality** | Offline analysis framework (`analysis/`); joins `trade_log` + `ohlcv` for forward-return labels at 4 horizons; per-signal accuracy, MWU weight evolution, and parameter sensitivity sweeps for `hours_back`, `entry_z`, `min_confidence`, `eta`; Markdown report with auto-recommendations |
 
 ---
 
@@ -61,7 +63,7 @@ trading_engine/
 │   ├── storage.py               # TimescaleDB — OHLCV, signals, regimes, news
 │   ├── alpaca_client.py         # AlpacaMarketData + AlpacaNewsClient (bars, quotes, news, stream)
 │   ├── alphavantage_client.py   # AlphaVantageNewsClient (retained for reference; not used in pipeline)
-│   └── fundamentals_client.py   # FundamentalsClient — yfinance market cap (24 h cache)
+│   └── fundamentals_client.py   # FundamentalsClient — yfinance market cap, earnings dates, analyst recs (24 h cache)
 ├── signals/
 │   ├── hmm_regime.py            # GaussianHMM regime detector
 │   ├── kalman_pairs.py          # Kalman adaptive hedge ratio
@@ -85,12 +87,19 @@ trading_engine/
 │   ├── check_alphavantage.py    # AV budget + news fetch check
 │   ├── check_alpaca.py          # Account, clock, quote, OHLCV, news check
 │   └── check_yfinance.py        # Market cap fetch, cache timing, field preview
+├── analysis/
+│   ├── outcome_labeler.py        # Join trade_log + ohlcv → forward-return labels
+│   ├── signal_quality.py         # Per-signal accuracy (hmm/ou/llm/analyst) by regime + confidence
+│   ├── weight_evolution.py       # MWU weight trajectory from trade_log.mwu_weights
+│   ├── parameter_sweep.py        # Sensitivity for hours_back, entry_z, min_confidence, eta
+│   ├── report.py                 # Markdown report generator with auto-recommendations
+│   └── run_analysis.py           # CLI entry point
 ├── dashboard/
 │   └── app.py                   # Streamlit trade decision dashboard
 ├── models/                      # Auto-created; HMM .pkl, Kalman .pkl, MWU .npy
 ├── utils/
 │   └── logging.py               # structlog factory (JSON file + console; colored regime banner)
-├── tests/                       # 431 unit tests — no live connections required
+├── tests/                       # 542 unit tests — no live connections required
 │   ├── tools/
 │   │   └── test_pair_scanner.py
 │   └── ...
@@ -117,11 +126,14 @@ New bar arrives
       │
       ├──► query signal_log  →  most recent llm_sentiment (12 h window)
       │
+      ├──► FundamentalsClient.get_analyst_recommendations()  →  ±1/0 (24 h cache)
+      │
       ▼
  signals = {
    "hmm_regime":    {signal: ±1/0, confidence},
    "ou_spread":     {signal: ±1/0, confidence},
    "llm_sentiment": {signal: ±1/0, confidence},
+   "analyst_recs":  {signal: ±1/0, confidence},
  }
       │
       ▼
@@ -351,7 +363,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 472 tests, no live connections required
+# Unit tests — 542 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -363,7 +375,8 @@ cd trading_engine
                  tests/test_engine.py \
                  tests/portfolio/ \
                  tests/tools/ \
-                 tests/test_fundamentals_client.py -v
+                 tests/test_fundamentals_client.py \
+                 tests/analysis/ -v
 
 # Integration tests — require live TimescaleDB
 TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
@@ -380,12 +393,13 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 53 | MWU weights (4-signal, half-weight init), decide, update, scheduled_update |
 | `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 103 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard; analyst signal |
+| `test_engine.py` | 105 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard; analyst signal logged to trade_log |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_fundamentals_client.py` | 32 | FundamentalsClient market cap, earnings dates, analyst recommendations — all with 24 h cache |
+| `tests/analysis/` | 68 | Offline analysis framework — outcome labels, per-signal accuracy, weight evolution, parameter sweeps; no DB required |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **472** | |
+| **Total (unit)** | **542** | |
 
 ---
 
@@ -444,6 +458,40 @@ because it rejects multi-ticker NEWS_SENTIMENT queries with `"Invalid inputs"` a
 | 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate | Complete |
 | 10 — Observability | Trade decision dashboard (Streamlit); colored regime banner in logs; `trade_log` DB table; contributing headlines persisted; per-ticker MWU weight files; HMM history seeding at startup | Complete |
 | 11 — News routing | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts | Complete |
+| 12 — Analyst signal | `FundamentalsClient.get_analyst_recommendations` (24 h cache); 4th MWU signal at half initial weight (1/7); `analyst_signal` + `analyst_confidence` columns in `trade_log`; auto-migration on bootstrap | Complete |
+| 13 — Decision quality | Offline analysis framework (`analysis/`); forward-return outcome labeling at 1 m / 15 m / 1 h / 4 h; per-signal accuracy and IC; MWU weight evolution; parameter sweeps for `hours_back`, `entry_z`, `min_confidence`, `eta`; Markdown report with auto-recommendations | Complete |
+
+---
+
+## Decision quality analysis
+
+After the engine has been running for 2+ weeks, use the offline analysis framework
+to assess signal quality and generate parameter recommendations:
+
+```bash
+cd trading_engine
+.venv/bin/python -m analysis.run_analysis \
+    --db-url "$DB_URL" \
+    --days 14 \
+    --output-dir analysis/reports/
+```
+
+The report covers:
+
+| Analysis | What it tells you |
+|---|---|
+| Ensemble accuracy | Win rate at 1 m / 15 m / 1 h / 4 h horizons, by regime and score band |
+| Per-signal accuracy | HMM, OU, LLM, and analyst recs win rates and information coefficients independently |
+| MWU weight evolution | Which signals the engine promoted vs demoted over time |
+| `hours_back` sweep | Does headline freshness correlate with LLM accuracy? |
+| `entry_z` sweep | OU accuracy vs trade frequency at z = 1.5 / 2.0 / 2.5 / 3.0 |
+| `min_confidence` sweep | Optimal score threshold (fewer but better trades) |
+| `eta` sweep | MWU learning-rate sensitivity via update replay |
+| Recommendations | Specific parameter change suggestions with supporting evidence |
+
+All analysis reads the live DB; no engine restart or code change required.
+Recommended cadence: first run after 2 weeks (tune `min_confidence`, `hours_back`);
+full review after 6 weeks (add `entry_z`, `eta`).
 
 ---
 

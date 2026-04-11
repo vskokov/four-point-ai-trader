@@ -81,6 +81,7 @@ def _load_trades(limit: int) -> pd.DataFrame:
                hmm_signal, hmm_confidence,
                ou_signal, ou_confidence, ou_zscore, ou_spread_value, ou_pair,
                llm_signal, llm_confidence,
+               analyst_signal, analyst_confidence,
                mwu_weights, contributing_headlines
         FROM   trade_log
         ORDER  BY time DESC

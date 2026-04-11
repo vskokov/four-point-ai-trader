@@ -22,6 +22,8 @@ All runnable code lives under `trading_engine/`.
 | **7 — Pair discovery** | Standalone pair scanner, JSON-driven pair loading, log-return correlation pre-filter | **Complete** |
 | **8 — Market-open guard** | Alpaca clock API (`is_market_open`), 60 s cache, three order-path guards | **Complete** |
 | **11 — News routing** | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts | **Complete** |
+| **12 — Analyst signal** | `FundamentalsClient.get_analyst_recommendations` (24 h cache); 4th MWU signal at half initial weight (1/7); `analyst_signal` + `analyst_confidence` columns in `trade_log`; auto-migration `ADD COLUMN IF NOT EXISTS` on bootstrap | **Complete** |
+| **13 — Decision quality** | Offline analysis framework (`analysis/`); forward-return outcome labeling at 1 m / 15 m / 1 h / 4 h; per-signal accuracy and IC; MWU weight evolution from `trade_log.mwu_weights`; parameter sweeps for `hours_back`, `entry_z`, `min_confidence`, `eta`; Markdown report with auto-recommendations | **Complete** |
 
 ---
 
@@ -53,6 +55,13 @@ trading_engine/
 │   └── state_manager.py     # Atomic JSON state + checksum + 3-backup rotation — COMPLETE
 ├── portfolio/
 │   └── portfolio_optimizer.py # PortfolioOptimizer (Black-Litterman + Min-Variance) — COMPLETE
+├── analysis/
+│   ├── outcome_labeler.py   # trade_log + ohlcv join → forward-return labels — COMPLETE
+│   ├── signal_quality.py    # Per-signal accuracy (all 4 signals) by regime/confidence/tod — COMPLETE
+│   ├── weight_evolution.py  # MWU weight trajectory from trade_log.mwu_weights — COMPLETE
+│   ├── parameter_sweep.py   # Sensitivity sweeps: hours_back, entry_z, min_confidence, eta — COMPLETE
+│   ├── report.py            # Markdown report generator with auto-recommendations — COMPLETE
+│   └── run_analysis.py      # CLI: python -m analysis.run_analysis --db-url $DB_URL — COMPLETE
 ├── utils/
 │   └── logging.py           # structlog factory
 ├── main.py                  # CLI entry point — COMPLETE
@@ -71,7 +80,12 @@ trading_engine/
 │   │   └── test_executor.py         # Unit tests — fully mocked (41 tests)
 │   ├── portfolio/
 │   │   └── test_portfolio_optimizer.py  # Unit tests — fully mocked (9 tests)
-│   └── test_engine.py               # Unit tests — fully mocked (98 tests)
+│   ├── analysis/
+│   │   ├── test_outcome_labeler.py  # Unit tests — synthetic DataFrames (14 tests)
+│   │   ├── test_signal_quality.py   # Unit tests — synthetic DataFrames (16 tests)
+│   │   ├── test_weight_evolution.py # Unit tests — synthetic DataFrames (16 tests)
+│   │   └── test_parameter_sweep.py  # Unit tests — synthetic DataFrames (22 tests)
+│   └── test_engine.py               # Unit tests — fully mocked (105 tests)
 ├── conftest.py              # Adds repo root to sys.path for pytest
 ├── requirements.txt
 ├── docker-compose.yml       # TimescaleDB container
@@ -144,12 +158,12 @@ no separate migration step needed.
 ```bash
 cd trading_engine
 
-# Unit tests only — no DB or network required (449 tests across 10 files)
+# Unit tests only — no DB or network required (542 tests across 14 files)
 .venv/bin/pytest tests/test_alpaca_client.py tests/test_alphavantage_client.py \
     tests/test_hmm_regime.py tests/test_mean_reversion.py tests/test_llm_sentiment.py \
     tests/backtesting/test_backtest_engine.py tests/meta_agent/test_mwu_agent.py \
     tests/execution/test_executor.py tests/test_engine.py tests/portfolio/ \
-    tests/test_fundamentals_client.py -v
+    tests/test_fundamentals_client.py tests/analysis/ -v
 
 # Integration tests — require live TimescaleDB
 TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
@@ -647,6 +661,40 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     a yfinance outage never blocks order submission.  `confidence = 0.7` when direction is
     non-zero (fixed proxy); `0.0` when neutral (so MWU score contribution is zero).
 
+### Analysis framework (`analysis/`)
+
+71. **`trade_log` schema migration uses `ADD COLUMN IF NOT EXISTS`** — the
+    `_DDL_TRADE_LOG_ADD_ANALYST` statement is executed in `_bootstrap_schema` on every
+    startup.  It is a no-op on a fresh DB (columns already in `_DDL_TRADE_LOG`) and safely
+    adds `analyst_signal INT` and `analyst_confidence FLOAT` to any pre-existing table
+    without restarting the DB or running a manual migration script.
+
+72. **`compute_outcome_labels` is a pure DataFrame transform** — the DB query lives in
+    `load_labeled_decisions`; the label computation logic is in `compute_outcome_labels(df)`.
+    This separation lets all analysis unit tests use synthetic DataFrames with no DB
+    connection.  Test correctness labels by passing a DataFrame with `close_at` and
+    `close_1m/15m/1h/4h` columns directly.
+
+73. **`correct_*` is `NaN`, not `False`, when forward return is missing** — when
+    `close_Xm` is `NaN` (e.g. market closed, insufficient ohlcv data), `fwd_ret_Xm` is
+    `NaN` and `correct_Xm` is masked to `NaN` via `.where(directional & has_ret)`.
+    Use `dropna(subset=[correct_col])` before computing win rates, not `fillna(False)`.
+
+74. **NaN headline age → treated as mixed (stale) in `sweep_hours_back`** — rows where
+    `contributing_headlines` is empty or `published_at` timestamps are missing get
+    `_oldest_h = NaN`.  The sweep classifies them as *mixed* (`NaN` is not `<= cutoff`)
+    so they don't inflate fresh-window accuracy counts.
+
+75. **All sweep functions guard against empty or column-less DataFrames** — each sweep
+    function checks `if df.empty or "<required_col>" not in df.columns: return pd.DataFrame()`
+    before accessing columns.  Callers receive an empty DataFrame (not a KeyError) when
+    given an empty input.
+
+76. **`signal_quality._SIGNAL_MAP` now includes `analyst`** — mapped to
+    `("analyst_signal", "analyst_confidence")`.  The per-signal accuracy loop skips any
+    signal whose column is absent (`if sig_col not in df.columns: continue`), so old
+    trade_log snapshots without the analyst columns degrade gracefully to 3-signal analysis.
+
 ---
 
 ## TODO
@@ -721,3 +769,25 @@ already fetches market caps and caches results for 24 hours.
   files trigger a shape-mismatch warning and reset to the new 4-signal defaults.
 - This signal is orthogonal to news sentiment — analysts update ratings weekly/monthly
   while LLM processes intraday headlines.
+- `trade_log` now stores `analyst_signal INT` and `analyst_confidence FLOAT` per decision.
+  `_DDL_TRADE_LOG_ADD_ANALYST` migration (ADD COLUMN IF NOT EXISTS) runs automatically in
+  `_bootstrap_schema` — no manual DB migration required.
+  `analysis/signal_quality.py` includes analyst in `_SIGNAL_MAP` for full 4-signal
+  accuracy analysis.
+
+**4. Decision quality analysis framework — COMPLETE**
+
+- `analysis/` module: `outcome_labeler`, `signal_quality`, `weight_evolution`,
+  `parameter_sweep`, `report`, `run_analysis`.
+- `outcome_labeler.load_labeled_decisions(db_url)` joins `trade_log` + `ohlcv` to
+  compute forward returns at +1 m, +15 m, +1 h, +4 h horizons.
+- `signal_quality.compute_signal_accuracy(df)` — per-signal win rate and IC, segmented
+  by regime, confidence band, time-of-day.
+- `weight_evolution.summarise_weight_evolution(wdf)` — detects drifted (>20%) and
+  collapsed (<0.05) MWU weights from `trade_log.mwu_weights` time-series.
+- `parameter_sweep` — four sweeps using already-logged data: `hours_back` (headline ages
+  from `contributing_headlines`), `entry_z` (from `ou_zscore`), `min_confidence` (from
+  `score`), `eta` (MWU replay).
+- `report.generate_report(...)` — Markdown output with specific change recommendations.
+- CLI: `.venv/bin/python -m analysis.run_analysis --db-url $DB_URL --days 14`.
+- 68 unit tests in `tests/analysis/` — all use synthetic DataFrames, no DB required.

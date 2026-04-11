@@ -1999,3 +1999,36 @@ class TestAnalystSignal:
         signals_passed = call_kwargs.kwargs.get("signals") or call_kwargs.args[1]
         assert "analyst_recs" in signals_passed
         assert signals_passed["analyst_recs"]["signal"] == 1
+
+    def test_analyst_signal_logged_to_trade_log(self, tmp_path):
+        """
+        bar_handler must write analyst_signal and analyst_confidence to trade_log.
+        """
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path,
+            mwu_decision=_mwu_decision(signal=1),
+        )
+        mock_alpaca.is_market_open.return_value = True
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": -1}
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._storage.insert_trade_log.assert_called_once()
+        logged = engine._storage.insert_trade_log.call_args[0][0]
+        assert logged["analyst_signal"] == -1
+        assert logged["analyst_confidence"] == pytest.approx(0.7)
+
+    def test_analyst_neutral_confidence_zero_in_trade_log(self, tmp_path):
+        """When analyst signal is 0, confidence logged as 0.0."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path,
+            mwu_decision=_mwu_decision(signal=1),
+        )
+        mock_alpaca.is_market_open.return_value = True
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": 0}
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        logged = engine._storage.insert_trade_log.call_args[0][0]
+        assert logged["analyst_signal"] == 0
+        assert logged["analyst_confidence"] == pytest.approx(0.0)

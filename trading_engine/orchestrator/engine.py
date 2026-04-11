@@ -748,6 +748,8 @@ class TradingEngine:
                     "ou_pair":                ou_signal.get("pair"),
                     "llm_signal":             int(llm_signal.get("signal", 0)),
                     "llm_confidence":         float(llm_signal.get("confidence", 0.0)),
+                    "analyst_signal":         int(analyst_signal.get("signal", 0)),
+                    "analyst_confidence":     float(analyst_signal.get("confidence", 0.0)),
                     "mwu_weights":            decision.get("weights"),
                     "contributing_headlines": llm_signal.get("contributing_headlines", []),
                 })
