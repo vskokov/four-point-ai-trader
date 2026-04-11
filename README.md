@@ -37,7 +37,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 | **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
 | **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
 | **LLM sentiment** | Local Ollama (Gemma 4 e4b) scores news headlines into directional signals; retries on malformed JSON; 60-second timeout → safe neutral fallback |
-| **Meta-agent** | Multiplicative Weights Update (MWU) ensemble conditioned on HMM regime; per-regime weight isolation; online learning from realised price directions |
+| **Meta-agent** | Multiplicative Weights Update (MWU) ensemble over 4 signals (HMM, OU, LLM, analyst recs) conditioned on HMM regime; analyst recs start at half weight (1/7 vs 2/7); per-regime weight isolation; online learning from realised price directions |
 | **Backtesting** | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results |
 | **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys, cash re-fetched after sells) |
 | **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
@@ -351,7 +351,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 449 tests, no live connections required
+# Unit tests — 472 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -378,14 +378,14 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_mean_reversion.py` | 36 | Cointegration, OU params, Kalman hedge ratio |
 | `test_llm_sentiment.py` | 56 | LLM prompt, parse, retry, pipeline (Alpaca-only mode) |
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
-| `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
+| `test_mwu_agent.py` | 53 | MWU weights (4-signal, half-weight init), decide, update, scheduled_update |
 | `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 98 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard |
+| `test_engine.py` | 103 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard; analyst signal |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
-| `test_fundamentals_client.py` | 19 | FundamentalsClient market cap fetch, 24 h cache; earnings date fetch, 24 h cache |
+| `test_fundamentals_client.py` | 32 | FundamentalsClient market cap, earnings dates, analyst recommendations — all with 24 h cache |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **449** | |
+| **Total (unit)** | **472** | |
 
 ---
 

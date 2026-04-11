@@ -1,15 +1,20 @@
 """Multiplicative Weights Update (MWU) meta-agent.
 
-Combines signals from hmm_regime, ou_spread, and llm_sentiment using the
-Multiplicative Weights Update algorithm, conditioned on the current HMM
-market regime.
+Combines signals from hmm_regime, ou_spread, llm_sentiment, and analyst_recs
+using the Multiplicative Weights Update algorithm, conditioned on the current
+HMM market regime.
 
-For each regime r ∈ {0,1,2} a weight vector w^r ∈ R^3 is maintained.
+For each regime r ∈ {0,1,2} a weight vector w^r ∈ R^4 is maintained.
 After each decision round the per-signal losses are used to exponentially
 down-weight signals that disagreed with the realised price direction, then
 weights are renormalised.  The ensemble signal is the sign of the
 confidence-weighted dot product of the current regime's weight vector with
 the incoming signal values.
+
+Initial weights: analyst_recs starts at half the weight of the other three
+signals — 3×(2/7) + 1×(1/7) = 1 — reflecting that analyst recommendations
+update infrequently (weekly / monthly) compared to intraday signals.
+MWU adapts all weights online from this starting point.
 """
 
 from __future__ import annotations
@@ -32,7 +37,16 @@ _MODELS_DIR = Path(__file__).parent.parent / "models"
 _WEIGHTS_FILENAME_TEMPLATE = "mwu_weights_{ticker}.npy"
 
 # Canonical signal names — order defines column indices in the weight matrix.
-_SIGNAL_NAMES: list[str] = ["hmm_regime", "ou_spread", "llm_sentiment"]
+_SIGNAL_NAMES: list[str] = ["hmm_regime", "ou_spread", "llm_sentiment", "analyst_recs"]
+
+# Initial weight per signal.  analyst_recs starts at half the weight of the
+# other three signals: 3×(2/7) + 1×(1/7) = 1.  MWU adapts from this point.
+_INITIAL_SIGNAL_WEIGHTS: dict[str, float] = {
+    "hmm_regime":    2 / 7,
+    "ou_spread":     2 / 7,
+    "llm_sentiment": 2 / 7,
+    "analyst_recs":  1 / 7,
+}
 
 # Regime label lookup
 _REGIME_LABELS: dict[int, str] = {0: "bear", 1: "neutral", 2: "bull"}
@@ -63,7 +77,7 @@ class MWUMetaAgent:
         self,
         ticker: str = "default",
         eta: float = 0.1,
-        n_signals: int = 3,
+        n_signals: int = 4,
         n_regimes: int = 3,
         min_confidence: float = 0.3,
         models_dir: Path | str | None = None,
@@ -76,10 +90,10 @@ class MWUMetaAgent:
         self.signal_names: list[str] = _SIGNAL_NAMES[:n_signals]
         self._models_dir = Path(models_dir) if models_dir is not None else _MODELS_DIR
 
-        # Uniform initialisation: shape (n_regimes, n_signals)
-        self.weights: np.ndarray = np.full(
-            (n_regimes, n_signals), 1.0 / n_signals, dtype=float
-        )
+        # Half-weight initialisation for analyst_recs; uniform for everything else.
+        # Shape: (n_regimes, n_signals)
+        init_row = self._default_weights()
+        self.weights: np.ndarray = np.tile(init_row, (n_regimes, 1))
 
         # History entries: {"timestamp": ..., "regime": ..., "weights": ndarray}
         self.weight_history: list[dict[str, Any]] = []
@@ -101,6 +115,20 @@ class MWUMetaAgent:
 
     def _weights_path(self) -> Path:
         return self._models_dir / _WEIGHTS_FILENAME_TEMPLATE.format(ticker=self.ticker)
+
+    def _default_weights(self) -> np.ndarray:
+        """
+        Return the default initial weight vector for ``self.signal_names``.
+
+        Known signals use the values from ``_INITIAL_SIGNAL_WEIGHTS``; any
+        unknown signal name falls back to 1.0 before normalisation.
+        """
+        raw = np.array(
+            [_INITIAL_SIGNAL_WEIGHTS.get(name, 1.0) for name in self.signal_names],
+            dtype=float,
+        )
+        raw /= raw.sum()
+        return raw
 
     def _load_weights(self) -> None:
         """Load persisted weight matrix if it exists."""
@@ -279,8 +307,8 @@ class MWUMetaAgent:
         if row_sum > 0:
             self.weights[regime_t] /= row_sum
         else:
-            # Fallback: uniform reset if all weights collapsed to zero
-            self.weights[regime_t] = np.full(self.n_signals, 1.0 / self.n_signals)
+            # Fallback: reset to default initial weights if all weights collapsed
+            self.weights[regime_t] = self._default_weights()
 
         timestamp = datetime.now(tz=timezone.utc)
 

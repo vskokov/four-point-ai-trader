@@ -83,7 +83,7 @@ def _mwu_decision(signal: int = 1, score: float = 0.5) -> dict:
         "final_signal": signal,
         "score":        score,
         "regime":       2,
-        "weights":      {"hmm_regime": 0.4, "ou_spread": 0.3, "llm_sentiment": 0.3},
+        "weights":      {"hmm_regime": 0.3, "ou_spread": 0.3, "llm_sentiment": 0.3, "analyst_recs": 0.1},
         "timestamp":    datetime.now(tz=timezone.utc),
     }
 
@@ -152,6 +152,7 @@ def _build_engine(
                 "hmm_regime": 0.6,
                 "ou_spread": 0.55,
                 "llm_sentiment": 0.58,
+                "analyst_recs": 0.52,
             },
             "per_regime_win_rate": {"bear": 0.5, "neutral": 0.55, "bull": 0.6},
             "current_weights": {},
@@ -182,9 +183,11 @@ def _build_engine(
     mock_state = MagicMock()
     mock_state.load.return_value = None
 
-    # Fundamentals + Alpaca news mocks (used by sentiment_job)
+    # Fundamentals + Alpaca news mocks (used by sentiment_job and bar_handler)
     mock_fundamentals = MagicMock()
     mock_fundamentals.get_market_caps.return_value = {t: 1e12 for t in tickers}
+    mock_fundamentals.get_earnings_dates.return_value = {t: None for t in tickers}
+    mock_fundamentals.get_analyst_recommendations.return_value = {t: 0 for t in tickers}
     mock_alpaca_news = MagicMock()
     mock_alpaca_news.fetch_news.return_value = []
 
@@ -258,11 +261,13 @@ class TestBarHandler:
         call_kwargs = mwu_map["AAPL"].scheduled_update.call_args[1]
         assert call_kwargs["ticker"] == "AAPL"
 
-    def test_signals_dict_has_three_keys(self, tmp_path):
+    def test_signals_dict_has_four_keys(self, tmp_path):
         engine, _, _, mwu_map = _build_engine(tmp_path=tmp_path)
         engine.bar_handler(_make_bar("AAPL"))
         signals = mwu_map["AAPL"].scheduled_update.call_args[1]["signals"]
-        assert set(signals.keys()) == {"hmm_regime", "ou_spread", "llm_sentiment"}
+        assert set(signals.keys()) == {
+            "hmm_regime", "ou_spread", "llm_sentiment", "analyst_recs"
+        }
 
     def test_neutral_signal_no_order(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0))
@@ -696,9 +701,9 @@ class TestEODJob:
 
     def test_win_rate_updated_in_signal_stats(self, tmp_path):
         engine, _, _, mwu_map = _build_engine(tmp_path=tmp_path)
-        # All signals have 0.6 win rate → ensemble = 0.6
+        # Signals: hmm=0.60, ou=0.55, llm=0.58, analyst=0.52 → avg = 0.5625
         engine.eod_job()
-        assert engine._signal_stats["AAPL"]["win_rate"] == pytest.approx(0.58, abs=0.01)
+        assert engine._signal_stats["AAPL"]["win_rate"] == pytest.approx(0.5625, abs=0.01)
 
     def test_state_saved(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
@@ -1917,3 +1922,80 @@ class TestEarningsGuard:
         engine.bar_handler(_make_bar("AAPL"))
 
         engine._executor.submit_order.assert_called_once()
+
+# ===========================================================================
+# _get_analyst_signal
+# ===========================================================================
+
+class TestAnalystSignal:
+    """
+    Unit tests for TradingEngine._get_analyst_signal().
+
+    Verifies that the analyst recommendation is correctly fetched from
+    FundamentalsClient and mapped to a signal dict, and that the helper
+    fails open on any exception.
+    """
+
+    def test_buy_recommendation_returns_plus_one(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": 1}
+
+        result = engine._get_analyst_signal("AAPL")
+
+        assert result["signal"] == 1
+        assert result["confidence"] == pytest.approx(0.7)
+
+    def test_sell_recommendation_returns_minus_one(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": -1}
+
+        result = engine._get_analyst_signal("AAPL")
+
+        assert result["signal"] == -1
+        assert result["confidence"] == pytest.approx(0.7)
+
+    def test_hold_recommendation_returns_zero_confidence(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": 0}
+
+        result = engine._get_analyst_signal("AAPL")
+
+        assert result["signal"] == 0
+        assert result["confidence"] == pytest.approx(0.0)
+
+    def test_missing_ticker_returns_neutral(self, tmp_path):
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_analyst_recommendations.return_value = {}
+
+        result = engine._get_analyst_signal("AAPL")
+
+        assert result["signal"] == 0
+
+    def test_fails_open_on_exception(self, tmp_path):
+        """A crash in get_analyst_recommendations must return neutral, not raise."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._fundamentals.get_analyst_recommendations.side_effect = RuntimeError("yfinance down")
+
+        result = engine._get_analyst_signal("AAPL")
+
+        assert result["signal"] == 0
+        assert result["confidence"] == pytest.approx(0.0)
+
+    def test_analyst_signal_included_in_mwu_call(self, tmp_path):
+        """
+        bar_handler must pass analyst_recs to scheduled_update.
+        Verify it appears in the signals dict argument.
+        """
+        engine, _, mock_alpaca, mwu_map = _build_engine(
+            tmp_path=tmp_path,
+            mwu_decision=_mwu_decision(signal=0),
+        )
+        mock_alpaca.is_market_open.return_value = True
+        engine._fundamentals.get_analyst_recommendations.return_value = {"AAPL": 1}
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        call_kwargs = mwu_map["AAPL"].scheduled_update.call_args
+        signals_passed = call_kwargs.kwargs.get("signals") or call_kwargs.args[1]
+        assert "analyst_recs" in signals_passed
+        assert signals_passed["analyst_recs"]["signal"] == 1

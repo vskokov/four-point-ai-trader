@@ -632,6 +632,21 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     accidentally invalidating (or polluting) the earnings data.  Tests that assert on
     `yf.Ticker` call counts must be aware both methods may call `yf.Ticker` independently.
 
+69. **`analyst_recs` starts at half the MWU weight of the other three signals** —
+    `_INITIAL_SIGNAL_WEIGHTS` gives `hmm_regime`, `ou_spread`, `llm_sentiment` each
+    `2/7` and `analyst_recs` `1/7` (sums to 1).  This is applied both at init and when
+    the fallback reset fires (row-sum collapsed to zero).  Old weight files with shape
+    `(3, 3)` are rejected by `_load_weights` shape check and fall back to the new
+    4-signal defaults — a deprecation warning is logged.  Tests must patch
+    `_build_engine`'s `mock_fundamentals.get_analyst_recommendations.return_value` to a
+    `{ticker: 0}` dict (not a raw `MagicMock`) so `_get_analyst_signal` returns a clean
+    `{"signal": 0, "confidence": 0.0}` neutral.
+
+70. **`_get_analyst_signal` fails open** — wraps `FundamentalsClient.get_analyst_recommendations`
+    in `try/except` and returns `{"signal": 0, "confidence": 0.0}` on any exception, so
+    a yfinance outage never blocks order submission.  `confidence = 0.7` when direction is
+    non-zero (fixed proxy); `0.0` when neutral (so MWU score contribution is zero).
+
 ---
 
 ## TODO
@@ -691,15 +706,18 @@ already fetches market caps and caches results for 24 hours.
 - **Tests to add:** `TestRunPipeline::test_local_fallback_used_when_no_live_articles`,
   `test_local_fallback_skips_seen_hashes`, `test_no_fallback_when_live_articles_present`.
 
-**2. Analyst recommendations as an extra sentiment signal**
+**2. Analyst recommendations as an extra sentiment signal — COMPLETE**
 
-- Add `get_analyst_recommendations(tickers) -> dict[str, str]` to `FundamentalsClient`
-  using `yf.Ticker(t).info["recommendationKey"]` (`strong_buy`, `buy`, `hold`,
-  `sell`, `strong_sell`).
-- Map to a [-1, 0, 1] signal: `strong_buy`/`buy` → +1, `hold` → 0,
-  `sell`/`strong_sell` → -1.
-- Add an `analyst_recs` entry to the `signals` dict in `bar_handler` alongside
-  `hmm_regime`, `ou_spread`, `llm_sentiment`.
-- Integrate into `MWUMetaAgent` as a 4th signal arm (weight matrix becomes 3×4).
-- This signal is orthogonal to news sentiment — analysts update ratings infrequently
-  (weekly/monthly) while LLM processes intraday headlines.
+- `FundamentalsClient.get_analyst_recommendations(tickers)` added (24 h cache via
+  `self._recs_cache`; 10-worker parallel fetch; `_REC_MAP` maps `recommendationKey`
+  to `+1/0/-1`).
+- `TradingEngine._get_analyst_signal(ticker)` wraps the fundamentals call and returns
+  `{"signal": int, "confidence": float}` — confidence 0.7 for directional, 0.0 for neutral.
+  Fails open (returns neutral on any exception).
+- `bar_handler` passes `"analyst_recs"` as the 4th entry in the signals dict.
+- `MWUMetaAgent` now uses 4 signals (weight matrix 3×4).  `analyst_recs` is initialised
+  at half the weight of the other three: `3×(2/7) + 1×(1/7) = 1`.  `_INITIAL_SIGNAL_WEIGHTS`
+  dict drives both init and fallback reset via `_default_weights()`.  Old `(3,3)` weight
+  files trigger a shape-mismatch warning and reset to the new 4-signal defaults.
+- This signal is orthogonal to news sentiment — analysts update ratings weekly/monthly
+  while LLM processes intraday headlines.

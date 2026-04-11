@@ -34,6 +34,7 @@ def _bull_signals(conf: float = 1.0) -> dict[str, dict[str, Any]]:
         "hmm_regime":    {"signal": 1,  "confidence": conf},
         "ou_spread":     {"signal": 1,  "confidence": conf},
         "llm_sentiment": {"signal": 1,  "confidence": conf},
+        "analyst_recs":  {"signal": 1,  "confidence": conf},
     }
 
 
@@ -42,15 +43,17 @@ def _bear_signals(conf: float = 1.0) -> dict[str, dict[str, Any]]:
         "hmm_regime":    {"signal": -1, "confidence": conf},
         "ou_spread":     {"signal": -1, "confidence": conf},
         "llm_sentiment": {"signal": -1, "confidence": conf},
+        "analyst_recs":  {"signal": -1, "confidence": conf},
     }
 
 
 def _mixed_signals() -> dict[str, dict[str, Any]]:
-    """hmm_regime=+1, ou_spread=−1, llm_sentiment=0."""
+    """hmm_regime=+1, ou_spread=−1, llm_sentiment=0, analyst_recs=0."""
     return {
         "hmm_regime":    {"signal": 1,  "confidence": 0.8},
         "ou_spread":     {"signal": -1, "confidence": 0.6},
         "llm_sentiment": {"signal": 0,  "confidence": 0.5},
+        "analyst_recs":  {"signal": 0,  "confidence": 0.0},
     }
 
 
@@ -59,11 +62,9 @@ def _mixed_signals() -> dict[str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 class TestInit:
-    def test_weights_uniform_at_start(self, tmp_path: Path) -> None:
+    def test_weights_shape_at_start(self, tmp_path: Path) -> None:
         agent = _make_agent(tmp_path)
-        assert agent.weights.shape == (3, 3)
-        expected = np.full((3, 3), 1.0 / 3)
-        np.testing.assert_allclose(agent.weights, expected)
+        assert agent.weights.shape == (3, 4)
 
     def test_weights_sum_to_one_per_regime(self, tmp_path: Path) -> None:
         agent = _make_agent(tmp_path)
@@ -72,7 +73,9 @@ class TestInit:
 
     def test_signal_names_set_correctly(self, tmp_path: Path) -> None:
         agent = _make_agent(tmp_path)
-        assert agent.signal_names == ["hmm_regime", "ou_spread", "llm_sentiment"]
+        assert agent.signal_names == [
+            "hmm_regime", "ou_spread", "llm_sentiment", "analyst_recs"
+        ]
 
     def test_weight_history_empty_at_start(self, tmp_path: Path) -> None:
         agent = _make_agent(tmp_path)
@@ -83,19 +86,67 @@ class TestInit:
         assert agent.eta == 0.5
 
     def test_loads_persisted_weights(self, tmp_path: Path) -> None:
-        """If mwu_weights_AAPL.npy exists, it is loaded instead of uniform init."""
-        saved = np.array([[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.2, 0.3, 0.5]])
+        """If mwu_weights_AAPL.npy exists with correct shape, it is loaded."""
+        saved = np.array([
+            [0.4, 0.3, 0.2, 0.1],
+            [0.25, 0.25, 0.3, 0.2],
+            [0.3, 0.3, 0.2, 0.2],
+        ])
         np.save(str(tmp_path / "mwu_weights_AAPL.npy"), saved)
         agent = _make_agent(tmp_path)
         np.testing.assert_allclose(agent.weights, saved)
 
     def test_ignores_wrong_shape_file(self, tmp_path: Path) -> None:
-        """A persisted file with wrong shape is ignored; uniform init is used."""
+        """A persisted file with wrong shape is ignored; half-weight init is used."""
         bad = np.ones((2, 5))
         np.save(str(tmp_path / "mwu_weights_AAPL.npy"), bad)
         agent = _make_agent(tmp_path)
-        expected = np.full((3, 3), 1.0 / 3)
-        np.testing.assert_allclose(agent.weights, expected)
+        # Falls back to _default_weights() — half-weight for analyst_recs
+        expected_row = np.array([2 / 7, 2 / 7, 2 / 7, 1 / 7])
+        for r in range(3):
+            np.testing.assert_allclose(agent.weights[r], expected_row, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Half-weight initialisation for analyst_recs
+# ---------------------------------------------------------------------------
+
+class TestHalfWeightInit:
+    def test_analyst_recs_starts_at_half_weight(self, tmp_path: Path) -> None:
+        """analyst_recs initial weight = 1/7; the other three are each 2/7."""
+        agent = _make_agent(tmp_path)
+        w = agent.weights[0]
+        # Indices: hmm_regime=0, ou_spread=1, llm_sentiment=2, analyst_recs=3
+        assert abs(w[0] - 2 / 7) < 1e-10
+        assert abs(w[1] - 2 / 7) < 1e-10
+        assert abs(w[2] - 2 / 7) < 1e-10
+        assert abs(w[3] - 1 / 7) < 1e-10
+
+    def test_half_weight_consistent_across_regimes(self, tmp_path: Path) -> None:
+        agent = _make_agent(tmp_path)
+        expected_row = np.array([2 / 7, 2 / 7, 2 / 7, 1 / 7])
+        for r in range(3):
+            np.testing.assert_allclose(agent.weights[r], expected_row, rtol=1e-10)
+
+    def test_fallback_reset_uses_half_weight(self, tmp_path: Path) -> None:
+        """When all weights collapse to exactly 0, reset uses _default_weights()."""
+        agent = _make_agent(tmp_path, eta=0.1)
+        # Force weights to exactly zero so row_sum == 0 triggers the fallback
+        agent.weights[1] = np.array([0.0, 0.0, 0.0, 0.0])
+        agent.update_weights("AAPL", _bull_signals(), regime_t=1, actual_direction=1)
+        expected_row = np.array([2 / 7, 2 / 7, 2 / 7, 1 / 7])
+        np.testing.assert_allclose(agent.weights[1], expected_row, rtol=1e-10)
+
+    def test_shape_mismatch_on_load_resets_to_half_weight(self, tmp_path: Path) -> None:
+        """Old (3, 3) weight file triggers shape-mismatch warning, resets to 4-signal init."""
+        old_weights = np.full((3, 3), 1 / 3)
+        np.save(str(tmp_path / "mwu_weights_AAPL.npy"), old_weights)
+        agent = _make_agent(tmp_path)
+        # Shape mismatch → falls back to default init
+        assert agent.weights.shape == (3, 4)
+        expected_row = np.array([2 / 7, 2 / 7, 2 / 7, 1 / 7])
+        for r in range(3):
+            np.testing.assert_allclose(agent.weights[r], expected_row, rtol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -234,14 +285,16 @@ class TestUpdateWeights:
         self, tmp_path: Path
     ) -> None:
         """
-        Signal 'hmm_regime' always correct, 'ou_spread' and 'llm_sentiment'
-        always wrong.  After many rounds hmm_regime's weight should dominate.
+        Signal 'hmm_regime' always correct, 'ou_spread', 'llm_sentiment', and
+        'analyst_recs' always wrong.  After many rounds hmm_regime's weight
+        should dominate.
         """
         agent = _make_agent(tmp_path, eta=0.3)
         signals = {
             "hmm_regime":    {"signal": 1,  "confidence": 1.0},
             "ou_spread":     {"signal": -1, "confidence": 1.0},
             "llm_sentiment": {"signal": -1, "confidence": 1.0},
+            "analyst_recs":  {"signal": -1, "confidence": 1.0},
         }
         for _ in range(30):
             agent.update_weights(
@@ -253,6 +306,7 @@ class TestUpdateWeights:
         # hmm_regime (index 0) should have the highest weight in regime 1
         assert agent.weights[1, 0] > agent.weights[1, 1]
         assert agent.weights[1, 0] > agent.weights[1, 2]
+        assert agent.weights[1, 0] > agent.weights[1, 3]
 
     def test_consistently_wrong_signal_loses_weight(
         self, tmp_path: Path
@@ -264,6 +318,7 @@ class TestUpdateWeights:
             "hmm_regime":    {"signal": 1,  "confidence": 1.0},
             "ou_spread":     {"signal": -1, "confidence": 1.0},  # always wrong
             "llm_sentiment": {"signal": 1,  "confidence": 1.0},
+            "analyst_recs":  {"signal": 1,  "confidence": 1.0},
         }
         for _ in range(20):
             agent.update_weights("AAPL", signals, regime_t=1, actual_direction=1)
@@ -312,10 +367,11 @@ class TestUpdateWeights:
             "hmm_regime":    {"signal": 1,  "confidence": 1.0},  # correct
             "ou_spread":     {"signal": 0,  "confidence": 0.0},  # neutral → loss=0.5
             "llm_sentiment": {"signal": -1, "confidence": 1.0},  # wrong
+            "analyst_recs":  {"signal": 0,  "confidence": 0.0},  # neutral → loss=0.5
         }
         agent.update_weights("AAPL", signals, regime_t=1, actual_direction=1)
         w = agent.weights[1]
-        # correct > neutral > wrong (before normalisation relative order holds)
+        # correct (index 0) > neutral (index 1) > wrong (index 2)
         assert w[0] > w[1] > w[2]
 
     def test_multiple_updates_weights_always_sum_to_one(
@@ -352,6 +408,7 @@ class TestWeightPersistence:
                     "hmm_regime":    {"signal": 1,  "confidence": 1.0},
                     "ou_spread":     {"signal": -1, "confidence": 1.0},
                     "llm_sentiment": {"signal": 1,  "confidence": 1.0},
+                    "analyst_recs":  {"signal": 1,  "confidence": 1.0},
                 },
                 regime_t=1,
                 actual_direction=1,
@@ -376,9 +433,12 @@ class TestWeightPersistence:
             assert abs(agent2.weights[r].sum() - 1.0) < 1e-12
 
     def test_no_file_at_start_no_error(self, tmp_path: Path) -> None:
-        """No models file → no crash; uniform init used."""
+        """No models file → no crash; half-weight init used."""
         agent = _make_agent(tmp_path)
-        np.testing.assert_allclose(agent.weights, np.full((3, 3), 1.0 / 3))
+        assert agent.weights.shape == (3, 4)
+        expected_row = np.array([2 / 7, 2 / 7, 2 / 7, 1 / 7])
+        for r in range(3):
+            np.testing.assert_allclose(agent.weights[r], expected_row, rtol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +558,7 @@ class TestPerformanceReport:
             "hmm_regime":    {"signal": 1, "confidence": 1.0},
             "ou_spread":     {"signal": 1, "confidence": 1.0},
             "llm_sentiment": {"signal": 1, "confidence": 1.0},
+            "analyst_recs":  {"signal": 1, "confidence": 1.0},
         }
         for _ in range(10):
             agent.update_weights("AAPL", signals, regime_t=1, actual_direction=1)
@@ -511,6 +572,7 @@ class TestPerformanceReport:
             "hmm_regime":    {"signal": -1, "confidence": 1.0},
             "ou_spread":     {"signal": -1, "confidence": 1.0},
             "llm_sentiment": {"signal": -1, "confidence": 1.0},
+            "analyst_recs":  {"signal": -1, "confidence": 1.0},
         }
         for _ in range(10):
             agent.update_weights("AAPL", signals, regime_t=0, actual_direction=1)

@@ -520,6 +520,29 @@ class TradingEngine:
             )
             return False  # fail open — don't block trades on guard failure
 
+    def _get_analyst_signal(self, ticker: str) -> dict[str, Any]:
+        """
+        Return the consensus analyst recommendation as a MWU signal dict.
+
+        Maps ``recommendationKey`` via ``FundamentalsClient.get_analyst_recommendations``
+        to ``{"signal": -1/0/+1, "confidence": float}``.
+
+        Fails open — returns neutral on any exception so a yfinance outage
+        never blocks order submission.
+        """
+        try:
+            recs = self._fundamentals.get_analyst_recommendations([ticker])
+            direction = recs.get(ticker, 0) or 0
+            confidence = 0.7 if direction != 0 else 0.0
+            return {"signal": direction, "confidence": confidence}
+        except Exception as exc:
+            logger.warning(
+                "engine.analyst_signal.failed",
+                ticker=ticker,
+                error=str(exc)[:120],
+            )
+            return {"signal": 0, "confidence": 0.0}
+
     def _get_ou_signal_for_ticker(self, ticker: str) -> dict[str, Any]:
         """
         Return the OU spread signal for the first pair that contains *ticker*.
@@ -656,11 +679,15 @@ class TradingEngine:
         # 4. LLM sentiment
         llm_signal = self._get_latest_llm_signal(ticker)
 
-        # 5. Assemble signals dict and run MWU
+        # 5. Analyst recommendations (cached 24 h via FundamentalsClient)
+        analyst_signal = self._get_analyst_signal(ticker)
+
+        # 6. Assemble signals dict and run MWU
         signals: dict[str, dict[str, Any]] = {
             "hmm_regime":    hmm_signal,
             "ou_spread":     ou_signal,
             "llm_sentiment": llm_signal,
+            "analyst_recs":  analyst_signal,
         }
 
         decision = self._mwu[ticker].scheduled_update(
@@ -699,7 +726,7 @@ class TradingEngine:
             self._last_active_signal[ticker] = final_signal
             self._last_signal_change_time[ticker] = _now
 
-        # 6. Order submission + trade log
+        # 7. Order submission + trade log
         if final_signal != 0:
             # Always persist the decision so the dashboard shows it even when
             # the market is closed or the order is rejected.
@@ -756,7 +783,7 @@ class TradingEngine:
                         "engine.order_failed", ticker=ticker, error=str(exc)
                     )
 
-        # 7. Circuit breaker check (after any order attempt)
+        # 8. Circuit breaker check (after any order attempt)
         try:
             account_info = self._alpaca.get_account_info()
             if self._risk.circuit_breaker(account_info):

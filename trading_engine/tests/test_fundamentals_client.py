@@ -227,3 +227,109 @@ class TestGetEarningsDates:
             result = client.get_earnings_dates(["MSFT"])
         # Should still return a valid datetime (tz-naive attached UTC)
         assert result["MSFT"] is not None
+
+
+# ===========================================================================
+# get_analyst_recommendations
+# ===========================================================================
+
+def _mock_yf_ticker_recs(rec_key: str | None):
+    """Return a yf.Ticker mock whose .info['recommendationKey'] == rec_key."""
+    m = MagicMock()
+    m.info = {"recommendationKey": rec_key}
+    return m
+
+
+class TestGetAnalystRecommendations:
+
+    def test_strong_buy_returns_plus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("strongBuy")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 1
+
+    def test_buy_returns_plus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("buy")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 1
+
+    def test_hold_returns_zero(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("hold")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 0
+
+    def test_sell_returns_minus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("sell")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == -1
+
+    def test_strong_sell_returns_minus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("strongSell")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == -1
+
+    def test_outperform_returns_plus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("outperform")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 1
+
+    def test_underperform_returns_minus_one(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("underperform")):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == -1
+
+    def test_none_key_returns_zero(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs(None)):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 0
+
+    def test_exception_returns_zero(self):
+        def _bad(_ticker):
+            raise RuntimeError("network error")
+
+        with patch(f"{_MOD}.yf.Ticker", side_effect=_bad):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL"])
+        assert result["AAPL"] == 0
+
+    def test_empty_ticker_list_returns_empty_dict(self):
+        with patch(f"{_MOD}.yf.Ticker") as mock_ticker:
+            client = _make_client()
+            result = client.get_analyst_recommendations([])
+        assert result == {}
+        mock_ticker.assert_not_called()
+
+    def test_second_call_uses_cache(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("buy")) as mock_ticker:
+            client = _make_client()
+            client.get_analyst_recommendations(["AAPL"])
+            client.get_analyst_recommendations(["AAPL"])
+        assert mock_ticker.call_count == 1
+
+    def test_stale_cache_refetches(self):
+        with patch(f"{_MOD}.yf.Ticker", return_value=_mock_yf_ticker_recs("buy")) as mock_ticker:
+            client = _make_client()
+            client.get_analyst_recommendations(["AAPL"])
+
+            stale_time = datetime.now(tz=timezone.utc) - timedelta(hours=25)
+            client._recs_cache["AAPL"]["fetched_at"] = stale_time
+
+            client.get_analyst_recommendations(["AAPL"])
+        assert mock_ticker.call_count == 2
+
+    def test_multiple_tickers(self):
+        def _side(ticker):
+            return _mock_yf_ticker_recs({"AAPL": "buy", "MSFT": "sell"}[ticker])
+
+        with patch(f"{_MOD}.yf.Ticker", side_effect=_side):
+            client = _make_client()
+            result = client.get_analyst_recommendations(["AAPL", "MSFT"])
+        assert result["AAPL"] == 1
+        assert result["MSFT"] == -1

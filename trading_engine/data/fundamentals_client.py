@@ -37,6 +37,8 @@ class FundamentalsClient:
         self._cache: dict[str, dict[str, Any]] = {}
         # ticker → {"value": datetime | None, "fetched_at": datetime}
         self._earnings_cache: dict[str, dict[str, Any]] = {}
+        # ticker → {"value": int (-1/0/1), "fetched_at": datetime}
+        self._recs_cache: dict[str, dict[str, Any]] = {}
         logger.info("fundamentals_client.init")
 
     # ------------------------------------------------------------------
@@ -225,5 +227,105 @@ class FundamentalsClient:
             for future in as_completed(futures):
                 ticker, dt = future.result()
                 result[ticker] = dt
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Analyst recommendations
+    # ------------------------------------------------------------------
+
+    # Map yfinance recommendationKey values → directional signal.
+    _REC_MAP: dict[str, int] = {
+        "strongBuy":    1,
+        "buy":          1,
+        "outperform":   1,
+        "overweight":   1,
+        "hold":         0,
+        "neutral":      0,
+        "marketperform": 0,
+        "sell":         -1,
+        "strongSell":   -1,
+        "underperform": -1,
+        "underweight":  -1,
+    }
+
+    def get_analyst_recommendations(self, tickers: list[str]) -> dict[str, int]:
+        """
+        Return the consensus analyst recommendation as a directional signal
+        for each ticker.
+
+        Maps ``yf.Ticker(t).info["recommendationKey"]`` to:
+        - ``+1`` — buy / strong_buy / outperform / overweight
+        - ``0``  — hold / neutral / marketperform, or unknown
+        - ``-1`` — sell / strong_sell / underperform / underweight
+
+        Results are cached in-process for 24 hours (analyst ratings update
+        at most weekly).
+
+        Parameters
+        ----------
+        tickers:
+            Equity symbols, e.g. ``["AAPL", "MSFT"]``.
+
+        Returns
+        -------
+        dict[str, int]
+            ``{ticker: signal}`` — defaults to ``0`` when data is unavailable.
+        """
+        if not tickers:
+            return {}
+
+        now = datetime.now(tz=timezone.utc)
+        result: dict[str, int] = {}
+        to_fetch: list[str] = []
+
+        for t in tickers:
+            entry = self._recs_cache.get(t)
+            if entry and (now - entry["fetched_at"]).total_seconds() < _CACHE_TTL_SECONDS:
+                result[t] = entry["value"]
+            else:
+                to_fetch.append(t)
+
+        if to_fetch:
+            logger.info(
+                "fundamentals_client.analyst_recs.fetch",
+                n_tickers=len(to_fetch),
+                tickers=to_fetch,
+            )
+            fetched = self._fetch_analyst_recs_parallel(to_fetch)
+            for t, signal in fetched.items():
+                result[t] = signal
+                self._recs_cache[t] = {"value": signal, "fetched_at": now}
+
+        return result
+
+    def _fetch_analyst_recs_parallel(
+        self, tickers: list[str]
+    ) -> dict[str, int]:
+        """Fetch analyst recommendation signals for *tickers* in parallel."""
+        result: dict[str, int] = {}
+
+        def _fetch_one(ticker: str) -> tuple[str, int]:
+            try:
+                info = yf.Ticker(ticker).info
+                key = (info.get("recommendationKey") or "").strip().lower()
+                # Normalise casing variants (e.g. "strongBuy" vs "strongbuy")
+                for raw_key, signal in self._REC_MAP.items():
+                    if key == raw_key.lower():
+                        return ticker, signal
+                return ticker, 0
+            except Exception as exc:
+                logger.warning(
+                    "fundamentals_client.analyst_recs.error",
+                    ticker=ticker,
+                    exc=str(exc)[:120],
+                )
+                return ticker, 0
+
+        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as executor:
+            futures = {executor.submit(_fetch_one, t): t for t in tickers}
+            for future in as_completed(futures):
+                ticker, signal = future.result()
+                result[ticker] = signal
 
         return result
