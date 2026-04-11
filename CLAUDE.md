@@ -21,7 +21,7 @@ All runnable code lives under `trading_engine/`.
 | **6 — Portfolio** | PortfolioOptimizer (Black-Litterman + Min-Variance, LedoitWolf, daily rebalance job) | **Complete** |
 | **7 — Pair discovery** | Standalone pair scanner, JSON-driven pair loading, log-return correlation pre-filter | **Complete** |
 | **8 — Market-open guard** | Alpaca clock API (`is_market_open`), 60 s cache, three order-path guards | **Complete** |
-| **11 — News routing** | `FundamentalsClient` (yfinance, 24 h cap cache); top-30 by market cap → AV; remaining → Alpaca News; connectivity check scripts | **Complete** |
+| **11 — News routing** | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts | **Complete** |
 
 ---
 
@@ -35,7 +35,7 @@ trading_engine/
 ├── data/
 │   ├── storage.py           # TimescaleDB interface — COMPLETE
 │   ├── alpaca_client.py     # AlpacaMarketData + AlpacaNewsClient — COMPLETE
-│   └── alphavantage_client.py # AlphaVantageNewsClient (primary news) — COMPLETE
+│   └── alphavantage_client.py # AlphaVantageNewsClient (retained for reference; not used in pipeline) — COMPLETE
 ├── signals/
 │   ├── hmm_regime.py        # GaussianHMM regime detector (bear/neutral/bull) — COMPLETE
 │   ├── kalman_pairs.py      # Kalman adaptive hedge ratio for pairs — COMPLETE
@@ -71,7 +71,7 @@ trading_engine/
 │   │   └── test_executor.py         # Unit tests — fully mocked (41 tests)
 │   ├── portfolio/
 │   │   └── test_portfolio_optimizer.py  # Unit tests — fully mocked (9 tests)
-│   └── test_engine.py               # Unit tests — fully mocked (46 tests)
+│   └── test_engine.py               # Unit tests — fully mocked (87 tests)
 ├── conftest.py              # Adds repo root to sys.path for pytest
 ├── requirements.txt
 ├── docker-compose.yml       # TimescaleDB container
@@ -144,7 +144,7 @@ no separate migration step needed.
 ```bash
 cd trading_engine
 
-# Unit tests only — no DB or network required (336 tests across 9 files)
+# Unit tests only — no DB or network required (450 tests across 9 files)
 .venv/bin/pytest tests/test_alpaca_client.py tests/test_alphavantage_client.py \
     tests/test_hmm_regime.py tests/test_mean_reversion.py tests/test_llm_sentiment.py \
     tests/backtesting/test_backtest_engine.py tests/meta_agent/test_mwu_agent.py \
@@ -192,8 +192,9 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
 
 ### Alpaca client (`data/alpaca_client.py`)
 
-- `AlpacaNewsClient` is **optional** — not called in the default pipeline.
-  `AlphaVantageNewsClient` is the primary news source (pre-computed sentiment).
+- `AlpacaNewsClient` is the **primary news source** for the sentiment pipeline.
+  `sentiment_job` passes `av_tickers=[]` to `run_pipeline`, routing all tickers
+  through `AlpacaNewsClient` with no Alpha Vantage calls.
 - `fetch_news()` returns raw dicts and does **not** insert into the DB — the
   sentiment module scores them first, then calls `Storage.insert_news()`.
 - `_with_retry` duck-types `status_code` via `getattr` (not `except APIError`)
@@ -203,9 +204,10 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
 
 ### Alpha Vantage client (`data/alphavantage_client.py`)
 
-- **Primary news source** — always prefer over `AlpacaNewsClient`.
-- Rate limit: 25 req/day free tier. Tracked in `config/av_rate_state.json`.
-  Warn at 15 calls, hard-block at 20 (raises `RateLimitExceeded` before HTTP call).
+- **No longer used in the live pipeline.** AV free tier rejects multi-ticker
+  NEWS_SENTIMENT queries (30 tickers → `"Invalid inputs"`) and has a 20-call/day
+  hard limit that is exhausted within a few hours of trading.  The client code is
+  retained for reference and its unit tests still pass.
 - AV returns HTTP 200 for errors — detect `"Information"` and `"Note"` keys
   in the body and raise `AlphaVantageError`.
 - `rate_state_path` is injectable in `__init__` — pass `tmp_path / "..."` in
@@ -473,10 +475,10 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     `n_skipped`, and `n_errors` counts.  Tests that verify isolation must check
     that `submit_order` was called N times even when one call raises.
 
-48. **`run_pipeline` fetches news for all tickers in a single `fetch_news()` call** —
+48. **`run_pipeline` fetches news for all tickers in a single Alpaca `fetch_news()` call** —
     articles are grouped by the `"ticker"` field already present in each dict from
-    `_parse_feed`.  This keeps AV usage to 1 call per pipeline run instead of N.
-    The `limit` param is set to `"200"` to accommodate the larger multi-ticker
+    `_parse_feed`.  A single Alpaca call replaces N per-ticker calls and AV is never
+    invoked.  The `limit` param is set to `"200"` to accommodate the larger multi-ticker
     response.  Tests that previously used `fetch_news.side_effect` with one item
     per ticker must be updated to use `fetch_news.return_value` with a combined list.
 
@@ -496,13 +498,10 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
 
 51. **Sentiment scheduling uses two cron jobs** — `sentiment_job_early` (every
     25 min, 07:00–10:29 ET) and `sentiment_job_late` (every 35 min, 10:30–16:30 ET).
-    Budget math: ~8 + ~10 = ~18 calls/day.  `sentiment_job()` has a soft budget
-    check that skips the run if `get_daily_call_count() >= 20`; the hard limit
-    (raises `RateLimitExceeded`) remains at 20 in `_check_and_increment()`.
-    Total APScheduler jobs is now 4.  `sentiment_job()` no longer has its own
-    market-hours guard — the cron windows handle that.  Tests must configure
-    `engine._av_client.get_daily_call_count.return_value` to an int (default
-    MagicMock comparison with `>= 20` is truthy and would skip the job).
+    Total APScheduler jobs is 4.  `sentiment_job()` no longer has its own
+    market-hours guard — the cron windows handle that.  No AV budget check is
+    performed; `sentiment_job` always calls `run_pipeline` with `av_tickers=[]`
+    so all tickers route through `AlpacaNewsClient` unconditionally.
 
 52. **`hours_back` defaults to 2 (was 8)** — with runs every 25–35 minutes, the
     long lookback is unnecessary.  The in-process `_seen_hashes` dedup cache
@@ -595,13 +594,23 @@ Teardown deletes all rows with `ticker = 'TEST'` after the module-scoped session
     Patch `trading_engine.data.fundamentals_client.yf.Ticker` (not the module-level
     `yf`) in tests.  `side_effect` is needed when multiple tickers return different caps.
 
-64. **`sentiment_job` splits tickers by market cap** — top `_AV_MAX_TICKERS` (= 30) by
-    market cap go to Alpha Vantage (richer pre-computed sentiment); remaining tickers use
-    `AlpacaNewsClient` as fallback.  Alpaca articles have `relevance_score=1.0` injected
-    so they pass `LLMSentimentSignal.score`'s `min_relevance=0.3` filter.  AV still counts
-    as 1 call per pipeline run regardless of how many tickers are in the top-30 subset.
+64. **`sentiment_job` routes all tickers through `AlpacaNewsClient`** — it passes
+    `av_tickers=[]` to `run_pipeline`, which sets `_av_fetch_list = []` (no AV call)
+    and `_alpaca_fetch_list = all tickers`.  Alpaca articles have `relevance_score=1.0`
+    injected so they pass `LLMSentimentSignal.score`'s `min_relevance=0.3` filter.
+    AV was abandoned because its free tier rejects multi-ticker queries with
+    `"Invalid inputs"` and the 20-call/day quota is exhausted within a few hours.
 
-65. **`np.float64` / numpy scalar types crash psycopg2** — `MWUMetaAgent.decide()` returns
+65. **HMM online refit must create a fresh `GaussianHMM` instance** —
+    `partial_fit_online` calls `self.model.fit(X)` every `refit_every` bars.
+    If the model was already fitted (loaded from disk or from a prior refit),
+    hmmlearn warns "will be overwritten" for every parameter because `init_params='stmc'`
+    tells it to reinitialise everything.  The fix: reassign `self.model = GaussianHMM(...)`
+    before each `fit()` call in `partial_fit_online`.  This also avoids unintended
+    warm-starting from stale parameters — `_assign_state_labels` re-ranks states
+    after every fit anyway.
+
+66. **`np.float64` / numpy scalar types crash psycopg2** — `MWUMetaAgent.decide()` returns
     `score` as `np.float64`; `OUSpreadSignal.compute_signal()` returns `z_score` and
     `spread_value` as numpy floats.  psycopg2 cannot bind these — it serializes them as
     `np.float64(value)` which it then parses as schema `np`, raising
@@ -634,13 +643,13 @@ already fetches market caps and caches results for 24 hours.
 - **Problem:** with `hours_back=2`, quiet tickers (weekends, off-hours, low-coverage
   names like IONQ or QUBT) often return 0 articles. The LLM then gets no input and
   outputs a neutral fallback — which is correct but wastes the scoring slot.
-- **Solution:** after the live fetch (AV + Alpaca), for any ticker that still has
+- **Solution:** after the live Alpaca fetch, for any ticker that still has
   0 *new* articles (not yet in `_seen_hashes`), query the local `news` table
   for the **2 most recent stored articles** for that ticker, regardless of age.
   These act as context even if they are days old.
 - **Key constraint:** this fallback must be implemented in **`run_pipeline`**
   (or a helper called by it), NOT by widening the `hours_back` parameter passed
-  to AV or Alpaca — that would waste API quota fetching a large historical window.
+  to Alpaca — that would waste API quota fetching a large historical window.
   The DB query is free.
 - **Implementation sketch:**
   - In `run_pipeline`, after building `articles_by_ticker`, for each ticker where
@@ -658,9 +667,8 @@ already fetches market caps and caches results for 24 hours.
 - **New Storage method needed:** `query_news(ticker, limit=2) -> list[dict]`
   — `SELECT headline_hash, title, summary, source, fetched_at FROM news WHERE
   ticker = :ticker ORDER BY fetched_at DESC LIMIT :limit`. Returns dicts in the
-  same shape as `AlphaVantageNewsClient._parse_feed` output so `score()` works
-  unchanged. Add `relevance_score=0.5` (neutral, lower than AV's 1.0 but above
-  the `min_relevance=0.3` filter).
+  same shape as `AlpacaNewsClient.fetch_news` output so `score()` works
+  unchanged. Add `relevance_score=0.5` (neutral, above the `min_relevance=0.3` filter).
 - **Tests to add:** `TestRunPipeline::test_local_fallback_used_when_no_live_articles`,
   `test_local_fallback_skips_seen_hashes`, `test_no_fallback_when_live_articles_present`.
 

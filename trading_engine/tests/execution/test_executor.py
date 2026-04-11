@@ -484,6 +484,63 @@ class TestGetPositions:
 
 
 # ===========================================================================
+# OrderExecutor — get_todays_filled_buy_symbols
+# ===========================================================================
+
+def _fake_filled_order(symbol: str, side_value: str = "buy", filled_qty: float = 10.0):
+    from alpaca.trading.enums import OrderSide
+    return SimpleNamespace(
+        symbol=symbol,
+        side=OrderSide.BUY if side_value == "buy" else OrderSide.SELL,
+        filled_qty=str(filled_qty),
+    )
+
+
+class TestGetTodaysFilledBuySymbols:
+
+    def test_returns_buy_symbols_filled_today(self):
+        mock_trading = MagicMock()
+        mock_trading.get_orders.return_value = [
+            _fake_filled_order("AAPL", "buy",  10.0),
+            _fake_filled_order("MSFT", "buy",  5.0),
+            _fake_filled_order("JPM",  "sell", 3.0),  # sell — must be excluded
+        ]
+        executor = _make_executor(mock_trading, MagicMock())
+
+        result = executor.get_todays_filled_buy_symbols()
+
+        assert result == {"AAPL", "MSFT"}
+
+    def test_excludes_unfilled_orders(self):
+        mock_trading = MagicMock()
+        mock_trading.get_orders.return_value = [
+            _fake_filled_order("AAPL", "buy", 0.0),   # filled_qty=0 → not filled
+            _fake_filled_order("MSFT", "buy", 5.0),
+        ]
+        executor = _make_executor(mock_trading, MagicMock())
+
+        result = executor.get_todays_filled_buy_symbols()
+
+        assert result == {"MSFT"}
+
+    def test_returns_empty_set_when_no_orders(self):
+        mock_trading = MagicMock()
+        mock_trading.get_orders.return_value = []
+        executor = _make_executor(mock_trading, MagicMock())
+
+        assert executor.get_todays_filled_buy_symbols() == set()
+
+    def test_returns_empty_set_on_api_error(self):
+        mock_trading = MagicMock()
+        mock_trading.get_orders.side_effect = RuntimeError("Alpaca down")
+        executor = _make_executor(mock_trading, MagicMock())
+
+        # Must not raise — fallback returns empty set
+        result = executor.get_todays_filled_buy_symbols()
+        assert result == set()
+
+
+# ===========================================================================
 # OrderExecutor — close_all_positions
 # ===========================================================================
 

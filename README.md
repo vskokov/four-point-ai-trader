@@ -32,7 +32,7 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 
 | Layer | Capability |
 |---|---|
-| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpha Vantage news (top-30 tickers by market cap) + Alpaca News fallback for remainder; yfinance market-cap ranking with 24 h cache |
+| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking with 24 h cache |
 | **Pair discovery** | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON |
 | **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
 | **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
@@ -60,7 +60,7 @@ trading_engine/
 ├── data/
 │   ├── storage.py               # TimescaleDB — OHLCV, signals, regimes, news
 │   ├── alpaca_client.py         # AlpacaMarketData + AlpacaNewsClient (bars, quotes, news, stream)
-│   ├── alphavantage_client.py   # AlphaVantageNewsClient (primary news, top-30 cap tickers)
+│   ├── alphavantage_client.py   # AlphaVantageNewsClient (retained for reference; not used in pipeline)
 │   └── fundamentals_client.py   # FundamentalsClient — yfinance market cap (24 h cache)
 ├── signals/
 │   ├── hmm_regime.py            # GaussianHMM regime detector
@@ -156,7 +156,7 @@ New bar arrives
 - Docker (for TimescaleDB)
 - [Ollama](https://ollama.com/) with `gemma4:e4b` pulled
 - Alpaca account (paper recommended for testing)
-- Alpha Vantage API key (free tier: 25 req/day)
+- Alpha Vantage API key (required by `settings.py` at startup, but not used for news — AV free tier was abandoned due to multi-ticker query restrictions)
 
 ---
 
@@ -178,7 +178,7 @@ cp .env.example .env
 |---|---|---|---|
 | `ALPACA_API_KEY` | yes | — | Alpaca API key |
 | `ALPACA_SECRET_KEY` | yes | — | Alpaca secret key |
-| `ALPHAVANTAGE_API_KEY` | yes | — | Alpha Vantage API key |
+| `ALPHAVANTAGE_API_KEY` | yes | — | Alpha Vantage API key (loaded at startup; AV not used for news in pipeline) |
 | `DB_URL` | yes | — | `postgresql+psycopg2://trader:traderpass@localhost:5432/trading` |
 | `ALPACA_BASE_URL` | no | `https://paper-api.alpaca.markets` | Use paper endpoint |
 | `OLLAMA_HOST` | no | `http://localhost:11434` | Ollama server URL |
@@ -301,14 +301,14 @@ are reachable with real credentials:
 ```bash
 cd trading_engine
 
-# Alpha Vantage — uses 1 of 20 daily calls; skip if count ≥ 15
-.venv/bin/python scripts/check_alphavantage.py
-
 # Alpaca — account info, market clock, latest quote, OHLCV, Alpaca news
 .venv/bin/python scripts/check_alpaca.py
 
 # yfinance — no API key needed; market cap table + cache timing
 .venv/bin/python scripts/check_yfinance.py
+
+# Alpha Vantage — connectivity only (AV not used for news; retained for reference)
+.venv/bin/python scripts/check_alphavantage.py
 ```
 
 Each script prints `✓ / ✗ / ⚠` per check and exits 0 on success.
@@ -351,7 +351,7 @@ sequence.
 ```bash
 cd trading_engine
 
-# Unit tests — 431 tests, no live connections required
+# Unit tests — 450 tests, no live connections required
 .venv/bin/pytest tests/test_alpaca_client.py \
                  tests/test_alphavantage_client.py \
                  tests/test_hmm_regime.py \
@@ -376,16 +376,16 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
 | `test_alphavantage_client.py` | 30 | Alpha Vantage news + rate limiting |
 | `test_hmm_regime.py` | 28 | HMM fit, predict, online update, persistence |
 | `test_mean_reversion.py` | 36 | Cointegration, OU params, Kalman hedge ratio |
-| `test_llm_sentiment.py` | 56 | LLM prompt, parse, retry, pipeline, AV/Alpaca split |
+| `test_llm_sentiment.py` | 56 | LLM prompt, parse, retry, pipeline (Alpaca-only mode) |
 | `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
 | `test_mwu_agent.py` | 49 | MWU weights, decide, update, scheduled_update |
 | `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 72 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; cap-based ticker split |
+| `test_engine.py` | 87 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing |
 | `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
 | `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
 | `test_fundamentals_client.py` | 9 | FundamentalsClient market cap fetch, 24 h cache |
 | `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **431** | |
+| **Total (unit)** | **450** | |
 
 ---
 
@@ -417,14 +417,15 @@ rm trading_engine/models/engine_state.json*
 
 | Job | Trigger | Action |
 |---|---|---|
-| `sentiment_job_early` | Every 25 min, 07:00–10:29 ET Mon–Fri | Rank tickers by market cap → top 30 via AV, rest via Alpaca News → Gemma scoring → `signal_log` insert |
-| `sentiment_job_late` | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (different cadence for budget management) |
+| `sentiment_job_early` | Every 25 min, 07:00–10:29 ET Mon–Fri | All tickers via Alpaca News (single fetch call) → Gemma scoring → `signal_log` insert |
+| `sentiment_job_late` | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (lower cadence for later session) |
 | `market_open_job` | 09:31 ET Mon–Fri | Black-Litterman portfolio optimisation → rebalance execution (cash-gated buys) |
 | `eod_job` | 16:05 ET Mon–Fri | P&L log, MWU performance report, Kelly stat refresh, state save |
 
-Alpha Vantage budget: ~8 (early) + ~10 (late) ≈ 18 calls/day out of the 25
-free-tier limit. A soft guard at 20 calls skips the run; the hard limit (raise)
-is also at 20.
+No Alpha Vantage calls are made during sentiment jobs. AV's free tier was abandoned
+because it rejects multi-ticker NEWS_SENTIMENT queries with `"Invalid inputs"` and its
+20-call/day quota is exhausted within a few hours. All news now routes through
+`AlpacaNewsClient` with no daily call budget constraint.
 
 ---
 
@@ -442,7 +443,7 @@ is also at 20.
 | 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe | Complete |
 | 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate | Complete |
 | 10 — Observability | Trade decision dashboard (Streamlit); colored regime banner in logs; `trade_log` DB table; contributing headlines persisted; per-ticker MWU weight files; HMM history seeding at startup | Complete |
-| 11 — News routing | `FundamentalsClient` (yfinance, 24 h cap cache); top-30 by market cap → Alpha Vantage; remaining tickers → Alpaca News fallback; connectivity check scripts for AV / Alpaca / yfinance | Complete |
+| 11 — News routing | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts | Complete |
 
 ---
 

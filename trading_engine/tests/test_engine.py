@@ -211,6 +211,14 @@ def _build_engine(
     engine._emergency_close = False
     engine._scheduler   = None
 
+    from collections import deque
+    from trading_engine.orchestrator.engine import _REGIME_SMOOTH_WINDOW
+    all_tickers = list(tickers)
+    engine._regime_history = {t: deque(maxlen=_REGIME_SMOOTH_WINDOW) for t in all_tickers}
+    engine._stable_regime_label = {t: "neutral" for t in all_tickers}
+    engine._last_active_signal = {t: 0 for t in all_tickers}
+    engine._last_signal_change_time = {t: None for t in all_tickers}
+
     return engine, mock_storage, mock_alpaca, mwu_map
 
 
@@ -359,76 +367,317 @@ class TestBarHandler:
 
 
 # ===========================================================================
+# OU series alignment
+# ===========================================================================
+
+def _make_ohlcv_df(times: list, close: float = 100.0) -> pd.DataFrame:
+    """Build a minimal OHLCV DataFrame with the given timestamps."""
+    return pd.DataFrame({
+        "time":   times,
+        "ticker": "X",
+        "open":   close,
+        "high":   close + 1,
+        "low":    close - 1,
+        "close":  close,
+        "volume": 1_000,
+    })
+
+
+class TestOUSeriesAlignment:
+    """_get_ou_signal_for_ticker must align mismatched series before compute_signal."""
+
+    def _engine_with_pair(self, tmp_path, df1, df2):
+        """Build an engine wired with one pair (JPM/BAC) and stub storage."""
+        engine, mock_storage, _, _ = _build_engine(
+            tickers=("JPM", "BAC"),
+            pairs=(("JPM", "BAC"),),
+            tmp_path=tmp_path,
+            mwu_decision=_mwu_decision(signal=0),
+        )
+        # Stub query_ohlcv to return the provided DataFrames.
+        mock_storage.query_ohlcv.side_effect = lambda ticker, *_: (
+            df1.copy() if ticker == "JPM" else df2.copy()
+        )
+        # Ensure the OU signal is fitted so it proceeds past the min_rows guard.
+        ou = engine._ou_signals[("JPM", "BAC")]
+        ou.lookback = 5
+        return engine, ou
+
+    def test_equal_length_series_not_modified(self, tmp_path):
+        """When lengths match, compute_signal is called without alignment."""
+        times = [datetime(2025, 1, 15, 14, i, tzinfo=timezone.utc) for i in range(10)]
+        df1 = _make_ohlcv_df(times)
+        df2 = _make_ohlcv_df(times)
+        engine, ou = self._engine_with_pair(tmp_path, df1, df2)
+
+        engine._get_ou_signal_for_ticker("JPM")
+
+        call_args = ou.compute_signal.call_args
+        assert len(call_args[0][0]) == len(call_args[0][1]) == 10
+
+    def test_mismatched_series_aligned_to_shared_timestamps(self, tmp_path):
+        """Extra bars on one leg must be dropped; compute_signal gets equal lengths."""
+        times_common = [
+            datetime(2025, 1, 15, 14, i, tzinfo=timezone.utc) for i in range(10)
+        ]
+        # df2 has 2 extra bars not present in df1
+        times_extra = times_common + [
+            datetime(2025, 1, 15, 14, 10, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 14, 11, tzinfo=timezone.utc),
+        ]
+        df1 = _make_ohlcv_df(times_common)
+        df2 = _make_ohlcv_df(times_extra)
+        engine, ou = self._engine_with_pair(tmp_path, df1, df2)
+
+        engine._get_ou_signal_for_ticker("JPM")
+
+        call_args = ou.compute_signal.call_args
+        passed_df1, passed_df2 = call_args[0][0], call_args[0][1]
+        assert len(passed_df1) == len(passed_df2) == 10
+
+    def test_mismatched_series_aligned_correctly_both_sides(self, tmp_path):
+        """Each leg may have unique bars; only the intersection survives.
+        df1: 12 base + 1 unique = 13 bars
+        df2: 12 base + 2 unique = 14 bars  → different lengths → alignment fires
+        After alignment: 12 shared bars reach compute_signal.
+        """
+        base_times = [datetime(2025, 1, 15, 14, i, tzinfo=timezone.utc) for i in range(12)]
+        df1 = _make_ohlcv_df(base_times + [datetime(2025, 1, 15, 15, 0, tzinfo=timezone.utc)])
+        df2 = _make_ohlcv_df(base_times + [
+            datetime(2025, 1, 15, 15, 1, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 15, 2, tzinfo=timezone.utc),
+        ])
+        engine, ou = self._engine_with_pair(tmp_path, df1, df2)
+
+        engine._get_ou_signal_for_ticker("JPM")
+
+        call_args = ou.compute_signal.call_args
+        passed_df1, passed_df2 = call_args[0][0], call_args[0][1]
+        assert len(passed_df1) == len(passed_df2) == 12
+
+    def test_too_few_shared_bars_returns_neutral(self, tmp_path):
+        """If fewer than min_rows bars survive alignment, signal must be neutral 0."""
+        times_common = [datetime(2025, 1, 15, 14, i, tzinfo=timezone.utc) for i in range(3)]
+        times_extra = times_common + [
+            datetime(2025, 1, 15, 14, 10, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 14, 11, tzinfo=timezone.utc),
+            datetime(2025, 1, 15, 14, 12, tzinfo=timezone.utc),
+        ]
+        df1 = _make_ohlcv_df(times_common)   # only 3 shared bars
+        df2 = _make_ohlcv_df(times_extra)
+        engine, ou = self._engine_with_pair(tmp_path, df1, df2)
+        ou.lookback = 5   # min_rows = 5 > 3 shared
+
+        result = engine._get_ou_signal_for_ticker("JPM")
+
+        assert result["signal"] == 0
+        ou.compute_signal.assert_not_called()
+
+
+# ===========================================================================
+# Regime smoothing
+# ===========================================================================
+
+class TestRegimeSmoothing:
+    """Verify that a single-bar regime flip does not change the stable label."""
+
+    def test_stable_label_unchanged_on_single_outlier(self, tmp_path):
+        """One bear bar in a bull run should not flip the stable regime."""
+        engine, _, _, mwu_map = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        # Prime the history with 3 bull bars so stable label is "bull".
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime_label["AAPL"] == "bull"
+
+        # One bear bar arrives — stable label must stay "bull".
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime_label["AAPL"] == "bull"
+
+    def test_stable_label_flips_after_consecutive_streak(self, tmp_path):
+        """Three consecutive bear bars must flip the stable label to bear."""
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+
+        # Prime with bull.
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime_label["AAPL"] == "bull"
+
+        # Three consecutive bear bars — label must flip.
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime_label["AAPL"] == "bear"
+
+    def test_smoothed_signal_sent_to_mwu(self, tmp_path):
+        """MWU should receive the smoothed (stable) HMM signal, not the raw one."""
+        engine, _, _, mwu_map = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+
+        # Prime stable label as "bull" with 3 bars.
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+
+        # Now send one bear bar — MWU should still get hmm signal = +1 (bull).
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        mwu_map["AAPL"].scheduled_update.reset_mock()
+        engine.bar_handler(_make_bar("AAPL"))
+
+        signals = mwu_map["AAPL"].scheduled_update.call_args[1]["signals"]
+        assert signals["hmm_regime"]["signal"] == 1   # bull = +1, not bear = -1
+
+
+# ===========================================================================
+# Minimum holding period
+# ===========================================================================
+
+class TestHoldingPeriod:
+    """Verify that direction reversals within 15 minutes are suppressed."""
+
+    def test_reversal_within_15min_suppressed(self, tmp_path):
+        """A -1 signal arriving 5 min after a +1 must not reach submit_order."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.5)
+        )
+        mock_alpaca.is_market_open.return_value = True
+
+        # First bar: +1 signal is accepted and recorded.
+        engine.bar_handler(_make_bar("AAPL"))
+        assert engine._last_active_signal["AAPL"] == 1
+        engine._executor.submit_order.reset_mock()
+
+        # Simulate 5 minutes elapsed.
+        engine._last_signal_change_time["AAPL"] = (
+            datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+        )
+
+        # Send a -1 signal — must be suppressed.
+        engine._mwu["AAPL"].scheduled_update.return_value = _mwu_decision(
+            signal=-1, score=-0.5
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_not_called()
+
+    def test_reversal_after_15min_allowed(self, tmp_path):
+        """A -1 signal arriving 16 min after a +1 must reach submit_order."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.5)
+        )
+        mock_alpaca.is_market_open.return_value = True
+
+        engine.bar_handler(_make_bar("AAPL"))
+        engine._executor.submit_order.reset_mock()
+
+        # Simulate 16 minutes elapsed — past the holding period.
+        engine._last_signal_change_time["AAPL"] = (
+            datetime.now(tz=timezone.utc) - timedelta(minutes=16)
+        )
+
+        engine._mwu["AAPL"].scheduled_update.return_value = _mwu_decision(
+            signal=-1, score=-0.5
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_called_once()
+
+    def test_same_direction_not_suppressed(self, tmp_path):
+        """A repeated +1 signal within 15 min is not a reversal and must not be blocked."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.5)
+        )
+        mock_alpaca.is_market_open.return_value = True
+
+        engine.bar_handler(_make_bar("AAPL"))
+        engine._executor.submit_order.reset_mock()
+
+        # Same direction again, 2 min later.
+        engine._last_signal_change_time["AAPL"] = (
+            datetime.now(tz=timezone.utc) - timedelta(minutes=2)
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        # Position-limit or too-small may prevent a second submission, but the
+        # holding period must NOT be the reason — submit_order should be called.
+        engine._executor.submit_order.assert_called_once()
+
+    def test_signal_change_time_recorded_on_first_signal(self, tmp_path):
+        """The first non-zero signal should initialise _last_signal_change_time."""
+        engine, _, mock_alpaca, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=1, score=0.5)
+        )
+        mock_alpaca.is_market_open.return_value = True
+        assert engine._last_signal_change_time["AAPL"] is None
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        assert engine._last_signal_change_time["AAPL"] is not None
+        assert engine._last_active_signal["AAPL"] == 1
+
+
+# ===========================================================================
 # sentiment_job
 # ===========================================================================
 
 class TestSentimentJob:
     """
-    sentiment_job() no longer checks market hours (cron triggers handle that).
-    It checks the AV daily call count and skips if >= 20.
+    sentiment_job() routes all tickers through Alpaca News (no AV calls).
+    AV's free tier was abandoned due to multi-ticker "Invalid inputs" errors
+    and a 20-call/day hard limit that is exhausted within hours.
     """
 
-    def test_runs_when_budget_ok(self, tmp_path):
+    def test_always_calls_pipeline(self, tmp_path):
+        """sentiment_job must call run_pipeline unconditionally."""
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-        engine._av_client.get_daily_call_count.return_value = 0
         engine.sentiment_job()
         engine._llm.run_pipeline.assert_called_once()
+
+    def test_routes_all_tickers_via_alpaca(self, tmp_path):
+        """av_tickers must be [] and alpaca_client must be set."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine.sentiment_job()
         call_kwargs = engine._llm.run_pipeline.call_args
         # positional: tickers, av_client, storage
         assert call_kwargs.args[0] == engine._tickers
-        assert call_kwargs.args[1] is engine._av_client
         assert call_kwargs.args[2] is engine._storage
-        # keyword: av_tickers and alpaca_client must be present
-        assert "av_tickers" in call_kwargs.kwargs
-        assert "alpaca_client" in call_kwargs.kwargs
-
-    def test_market_caps_fetched_in_sentiment_job(self, tmp_path):
-        """sentiment_job must call get_market_caps to rank tickers."""
-        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-        engine._av_client.get_daily_call_count.return_value = 0
-        engine.sentiment_job()
-        engine._fundamentals.get_market_caps.assert_called_once_with(engine._tickers)
-
-    def test_av_tickers_capped_at_30(self, tmp_path):
-        """When universe > 30, only the top 30 by cap go to AV."""
-        # Build engine with 35 tickers, each with a distinct cap
-        tickers_35 = [f"T{i:02d}" for i in range(35)]
-        engine, _, _, _ = _build_engine(tickers=tuple(tickers_35), pairs=(), tmp_path=tmp_path)
-        # Assign caps so T00 > T01 > ... > T34
-        caps = {t: float(35 - i) * 1e9 for i, t in enumerate(tickers_35)}
-        engine._fundamentals.get_market_caps.return_value = caps
-        engine._av_client.get_daily_call_count.return_value = 0
-
-        engine.sentiment_job()
-
-        call_kwargs = engine._llm.run_pipeline.call_args.kwargs
-        assert len(call_kwargs["av_tickers"]) == 30
-        # Top-cap tickers must be in av_tickers
-        assert "T00" in call_kwargs["av_tickers"]
-        assert "T29" in call_kwargs["av_tickers"]
-        # Bottom-cap tickers must NOT be in av_tickers
-        assert "T30" not in call_kwargs["av_tickers"]
-        assert "T34" not in call_kwargs["av_tickers"]
-
-    def test_skipped_when_daily_budget_reached(self, tmp_path):
-        """At 20 calls, sentiment_job must skip run_pipeline."""
-        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-        engine._av_client.get_daily_call_count.return_value = 20
-        engine.sentiment_job()
-        engine._llm.run_pipeline.assert_not_called()
-
-    def test_runs_at_nineteen_calls(self, tmp_path):
-        """At 19 calls (one below the threshold), run_pipeline must still be called."""
-        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-        engine._av_client.get_daily_call_count.return_value = 19
-        engine.sentiment_job()
-        engine._llm.run_pipeline.assert_called_once()
+        # av_tickers=[] routes everything to Alpaca inside run_pipeline
+        assert call_kwargs.kwargs["av_tickers"] == []
+        assert call_kwargs.kwargs["alpaca_client"] is engine._alpaca_news
 
     def test_exception_does_not_propagate(self, tmp_path):
+        """A run_pipeline failure must be caught; the job must not raise."""
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
-        engine._av_client.get_daily_call_count.return_value = 0
-        engine._llm.run_pipeline.side_effect = RuntimeError("AV rate limit")
-        engine.sentiment_job()   # should not raise
+        engine._llm.run_pipeline.side_effect = RuntimeError("network error")
+        engine.sentiment_job()   # must not raise
 
 
 # ===========================================================================
@@ -544,6 +793,38 @@ class TestSchedulerSetup:
         assert early_kwargs["minute"] == "*/25"
         assert late_kwargs["hour"] == "10-16"
         assert late_kwargs["minute"] == "*/35"
+
+    def test_market_open_job_has_next_run_time(self, tmp_path):
+        """market_open_job must be registered with next_run_time so it fires at startup."""
+        from trading_engine.orchestrator.engine import TradingEngine
+
+        engine, _, mock_alpaca, _ = _build_engine(tmp_path=tmp_path)
+        mock_alpaca.is_market_open.return_value = False  # prevent rebalance orders
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.running = False
+
+        captured_kwargs: dict = {}
+
+        def capture_add_job(fn, *args, **kwargs):
+            if kwargs.get("id") == "market_open_job":
+                captured_kwargs.update(kwargs)
+
+        mock_scheduler.add_job.side_effect = capture_add_job
+
+        with patch(_SCHEDULER, return_value=mock_scheduler):
+            with patch.object(engine._alpaca, "stream_bars"):
+                with patch.object(engine, "_shutdown_event") as mock_event:
+                    mock_event.wait.side_effect = KeyboardInterrupt
+                    try:
+                        engine.run()
+                    except Exception:
+                        pass
+
+        assert "next_run_time" in captured_kwargs, (
+            "market_open_job must be registered with next_run_time"
+        )
+        assert captured_kwargs["next_run_time"] is not None
 
     def test_eod_job_scheduled_at_1605_et(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)
@@ -1047,6 +1328,9 @@ def _setup_rebalance_engine(
     from types import SimpleNamespace
     engine._executor._trading.submit_order.return_value = SimpleNamespace(id="test-order-id")
 
+    # Default: no same-day buys — PDT pre-check passes for all tickers.
+    engine._executor.get_todays_filled_buy_symbols.return_value = set()
+
     return engine, mock_alpaca
 
 
@@ -1253,6 +1537,94 @@ class TestMarketOpenJobRebalance:
 
 
 # ===========================================================================
+# PDT (Pattern Day Trader) protection
+# ===========================================================================
+
+class TestPDTProtection:
+    """
+    Verify that same-day sells are skipped and PDT broker errors are handled
+    gracefully rather than surfaced as hard errors.
+    """
+
+    def test_sell_skipped_when_position_opened_today(self, tmp_path):
+        """A sell for a ticker bought today must be skipped (pdt_skip), not submitted."""
+        orders = [_make_rebalance_order("TXT", "sell", dollar_amount=3_000.0)]
+        positions = _positions_df(("TXT", 10.0, 3_000.0))
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=positions
+        )
+        mock_alpaca.is_market_open.return_value = True
+        # TXT was bought today
+        engine._executor.get_todays_filled_buy_symbols.return_value = {"TXT"}
+
+        engine.market_open_job()
+
+        engine._executor._trading.submit_order.assert_not_called()
+
+    def test_sell_proceeds_when_position_opened_yesterday(self, tmp_path):
+        """A sell for a ticker NOT in today's buys must proceed normally."""
+        orders = [_make_rebalance_order("TXT", "sell", dollar_amount=1_500.0)]
+        positions = _positions_df(("TXT", 10.0, 1_500.0))
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=positions
+        )
+        mock_alpaca.is_market_open.return_value = True
+        engine._executor.get_todays_filled_buy_symbols.return_value = set()  # no same-day buys
+
+        engine.market_open_job()
+
+        engine._executor._trading.submit_order.assert_called_once()
+
+    def test_only_same_day_tickers_skipped_others_proceed(self, tmp_path):
+        """When two sells are pending and only one was bought today, only that one is skipped."""
+        orders = [
+            _make_rebalance_order("RGTI", "sell", dollar_amount=2_000.0),
+            _make_rebalance_order("TXT",  "sell", dollar_amount=2_000.0),
+        ]
+        positions = _positions_df(
+            ("RGTI", 20.0, 2_000.0),
+            ("TXT",  15.0, 2_000.0),
+        )
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=positions
+        )
+        mock_alpaca.is_market_open.return_value = True
+        # Only RGTI was bought today; TXT was not
+        engine._executor.get_todays_filled_buy_symbols.return_value = {"RGTI"}
+
+        submitted: list[str] = []
+        from types import SimpleNamespace as NS
+        def capture(req):
+            submitted.append(req.symbol)
+            return NS(id="ok")
+        engine._executor._trading.submit_order.side_effect = capture
+
+        engine.market_open_job()
+
+        assert submitted == ["TXT"]   # RGTI skipped, TXT executed
+
+    def test_pdt_broker_error_handled_as_warning_not_error(self, tmp_path, capsys):
+        """If PDT error slips through pre-check, the except block must log warning not error."""
+        orders = [_make_rebalance_order("TXT", "sell", dollar_amount=3_000.0)]
+        positions = _positions_df(("TXT", 10.0, 3_000.0))
+        engine, mock_alpaca = _setup_rebalance_engine(
+            tmp_path, rebalance_orders=orders, positions=positions
+        )
+        mock_alpaca.is_market_open.return_value = True
+        # Pre-check returns empty (simulating fetch failure), but Alpaca rejects
+        engine._executor.get_todays_filled_buy_symbols.return_value = set()
+        engine._executor._trading.submit_order.side_effect = Exception(
+            '{"code":40310100,"message":"trade denied due to pattern day trading protection"}'
+        )
+
+        engine.market_open_job()   # must not raise
+
+        out = capsys.readouterr().out
+        assert "pdt_skip" in out
+        assert "order_failed" not in out
+
+
+# ===========================================================================
 # startup_checks — historical seeding
 # ===========================================================================
 
@@ -1404,3 +1776,38 @@ class TestStartupChecksSeeding:
             engine.startup_checks()   # must not raise
 
         mock_hmm.fit.assert_called_once()
+
+    def test_portfolio_min_variance_seeded_in_startup(self, tmp_path):
+        """startup_checks() must call compute_min_variance() to seed weights."""
+        engine, mock_storage, mock_alpaca, _ = self._build_seeding_engine(
+            tmp_path, hmm_fitted=True
+        )
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()
+
+        engine.portfolio_optimizer.compute_min_variance.assert_called_once()
+
+    def test_portfolio_init_failure_does_not_abort_startup(self, tmp_path):
+        """If compute_min_variance raises, startup_checks must still complete."""
+        engine, mock_storage, mock_alpaca, _ = self._build_seeding_engine(
+            tmp_path, hmm_fitted=True
+        )
+        engine.portfolio_optimizer.compute_min_variance.side_effect = RuntimeError(
+            "DB unavailable"
+        )
+
+        with (
+            patch("ollama.Client") as mock_ollama_client,
+            patch(_SETTINGS, _fake_settings()),
+        ):
+            mock_ollama_client.return_value.list.return_value = SimpleNamespace(
+                models=[SimpleNamespace(model="gemma4:e4b")]
+            )
+            engine.startup_checks()   # must not raise

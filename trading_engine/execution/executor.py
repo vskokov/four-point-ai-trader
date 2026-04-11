@@ -13,8 +13,8 @@ from typing import Any
 
 import pandas as pd
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 import trading_engine.config.settings as settings
 from trading_engine.utils.logging import get_logger
@@ -290,6 +290,47 @@ class OrderExecutor:
             for pos in positions
         ]
         return pd.DataFrame(rows, columns=_COLS)
+
+    def get_todays_filled_buy_symbols(self) -> set[str]:
+        """
+        Return the set of symbols for which a BUY order was filled today (UTC).
+
+        Used by the rebalance engine to skip same-day sells that would trigger
+        FINRA Pattern Day Trader (PDT) protection on accounts with < $25 K equity.
+
+        Returns
+        -------
+        set[str]
+            Empty set on any error (caller falls back to reactive PDT handling).
+        """
+        today_midnight = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        try:
+            orders = _read_with_retry(
+                lambda: self._trading.get_orders(
+                    GetOrdersRequest(
+                        status=QueryOrderStatus.CLOSED,
+                        after=today_midnight,
+                        side=OrderSide.BUY,
+                        limit=500,
+                    )
+                ),
+                label="get_todays_orders",
+            )
+            return {
+                o.symbol for o in orders
+                if o.side == OrderSide.BUY
+                and o.filled_qty is not None
+                and float(o.filled_qty) > 0
+            }
+        except Exception as exc:
+            logger.warning(
+                "executor.todays_buys_fetch_failed",
+                error=str(exc),
+                hint="PDT pre-check skipped; reactive error handling still active",
+            )
+            return set()
 
     # ------------------------------------------------------------------
     # Emergency liquidation

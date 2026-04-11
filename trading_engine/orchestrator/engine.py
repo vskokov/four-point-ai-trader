@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,15 @@ _ET = ZoneInfo("America/New_York")
 # We reserve the top N by market cap for AV (richer per-ticker sentiment);
 # the remainder fall back to the Alpaca News API.
 _AV_MAX_TICKERS = 30
+
+# Regime smoothing: number of consecutive identical HMM labels required before
+# the engine accepts a regime change.  Prevents single-bar HMM chatter.
+_REGIME_SMOOTH_WINDOW = 3
+
+# Minimum holding period: suppress direction reversals within this many minutes
+# of the last signal change.  Matches the Alpaca free-tier 15-minute data delay
+# — decisions cannot be more precise than the data latency.
+_MIN_HOLD_MINUTES = 15
 
 
 def _to_float(value: Any) -> float | None:
@@ -252,6 +262,22 @@ class TradingEngine:
         self._emergency_close = False
         self._scheduler: BackgroundScheduler | None = None
 
+        # Regime smoothing: one deque per ticker accumulates recent raw HMM labels.
+        # The stable label only changes when _REGIME_SMOOTH_WINDOW bars all agree.
+        self._regime_history: dict[str, deque] = {
+            t: deque(maxlen=_REGIME_SMOOTH_WINDOW) for t in self._tickers
+        }
+        self._stable_regime_label: dict[str, str] = {
+            t: "neutral" for t in self._tickers
+        }
+
+        # Holding period: track the last non-zero signal and when it changed
+        # direction so reversals within _MIN_HOLD_MINUTES can be suppressed.
+        self._last_active_signal: dict[str, int] = {t: 0 for t in self._tickers}
+        self._last_signal_change_time: dict[str, datetime | None] = {
+            t: None for t in self._tickers
+        }
+
         # Load any persisted metadata
         self._load_state()
 
@@ -404,6 +430,21 @@ class TradingEngine:
                         error=str(exc),
                     )
 
+        # Seed portfolio weights synchronously so get_target_weight() never
+        # returns 0 + warning before market_open_job fires for the first time.
+        # min-variance requires only OHLCV history (already seeded above) and
+        # no return views, so it is safe to call here.
+        logger.info("engine.startup_checks.portfolio_init")
+        try:
+            self.portfolio_optimizer.compute_min_variance()
+            logger.info("engine.startup_checks.portfolio_weights_seeded")
+        except Exception as exc:
+            logger.warning(
+                "engine.startup_checks.portfolio_init_failed",
+                error=str(exc),
+                hint="weights will be initialized on first market_open_job run",
+            )
+
         logger.info("engine.startup_checks.done")
 
     # ------------------------------------------------------------------
@@ -462,6 +503,22 @@ class TradingEngine:
                 start = end - timedelta(days=3)   # ~390 min-bars
                 df1 = self._storage.query_ohlcv(pair[0], start, end)
                 df2 = self._storage.query_ohlcv(pair[1], start, end)
+
+                # Align on shared timestamps.  Alpaca may deliver a different
+                # number of bars per ticker due to gaps or feed latency; passing
+                # mismatched lengths to KalmanHedgeRatio raises a ValueError.
+                if len(df1) != len(df2):
+                    shared_times = set(df1["time"]).intersection(df2["time"])
+                    n_before = (len(df1), len(df2))
+                    df1 = df1[df1["time"].isin(shared_times)].reset_index(drop=True)
+                    df2 = df2[df2["time"].isin(shared_times)].reset_index(drop=True)
+                    logger.debug(
+                        "engine.ou_series_aligned",
+                        pair=pair,
+                        before=n_before,
+                        after=len(df1),
+                    )
+
                 min_rows = max(ou.lookback, 10)
                 if len(df1) < min_rows or len(df2) < min_rows:
                     return {"signal": 0, "confidence": 0.0, "z_score": None,
@@ -545,6 +602,24 @@ class TradingEngine:
                     "engine.hmm_predict_failed", ticker=ticker, error=str(exc)
                 )
 
+        # Regime smoothing: only adopt a new regime after _REGIME_SMOOTH_WINDOW
+        # consecutive bars agree.  A single outlier bar cannot flip the regime.
+        self._regime_history[ticker].append(regime_label)
+        _hist = self._regime_history[ticker]
+        if len(_hist) == _REGIME_SMOOTH_WINDOW and len(set(_hist)) == 1:
+            self._stable_regime_label[ticker] = _hist[0]
+        smoothed_label = self._stable_regime_label[ticker]
+        if smoothed_label != regime_label:
+            logger.debug(
+                "engine.regime_smoothed",
+                ticker=ticker,
+                raw_label=regime_label,
+                smoothed_label=smoothed_label,
+            )
+            regime_label = smoothed_label
+            direction = _REGIME_TO_SIGNAL.get(smoothed_label, 0)
+            hmm_signal = {"signal": direction, "confidence": hmm_signal["confidence"]}
+
         # 3. OU spread signal
         ou_signal = self._get_ou_signal_for_ticker(ticker)
 
@@ -566,6 +641,33 @@ class TradingEngine:
         )
 
         final_signal: int = decision["final_signal"]
+
+        # Minimum holding period: suppress direction reversals within _MIN_HOLD_MINUTES.
+        # Rationale: Alpaca free-tier data has a ~15-minute delay, so no decision can
+        # be more precise than that time scale.  Prevents rapid BUY→SELL→BUY churn
+        # driven by single-bar HMM noise that slips through regime smoothing.
+        _now = datetime.now(tz=timezone.utc)
+        _prev_sig = self._last_active_signal[ticker]
+        _last_t = self._last_signal_change_time[ticker]
+        if (
+            final_signal != 0
+            and _prev_sig != 0
+            and final_signal != _prev_sig
+            and _last_t is not None
+            and (_now - _last_t) < timedelta(minutes=_MIN_HOLD_MINUTES)
+        ):
+            _elapsed_min = (_now - _last_t).total_seconds() / 60
+            logger.info(
+                "engine.holding_period.suppressed",
+                ticker=ticker,
+                proposed_signal=final_signal,
+                held_signal=_prev_sig,
+                elapsed_min=round(_elapsed_min, 1),
+            )
+            final_signal = 0
+        if final_signal != 0 and final_signal != _prev_sig:
+            self._last_active_signal[ticker] = final_signal
+            self._last_signal_change_time[ticker] = _now
 
         # 6. Order submission + trade log
         if final_signal != 0:
@@ -640,57 +742,21 @@ class TradingEngine:
           - ``sentiment_job_early``: every 25 min, 07:00–10:29 ET, Mon–Fri
           - ``sentiment_job_late``:  every 35 min, 10:30–16:30 ET, Mon–Fri
 
-        Includes a soft budget guard: if the AV daily call count has already
-        reached 20 (the hard limit in ``_check_and_increment``), the run is
-        skipped to avoid raising ``RateLimitExceeded``.  The hard limit in
-        ``AlphaVantageNewsClient`` remains the authoritative cap.
+        All tickers are fetched via Alpaca News (no Alpha Vantage calls).
+        AV's free tier rejects multi-ticker queries with "Invalid inputs" and
+        has a 20-call/day hard limit that is exhausted within a few hours.
+        Alpaca News has no rate limits and returns equivalent article coverage.
         """
-        count = self._av_client.get_daily_call_count()
-        if count >= 20:
-            logger.warning(
-                "engine.sentiment_job.skipped",
-                reason="daily_budget_reached",
-                calls_today=count,
-            )
-            return
-
-        # Rank tickers by market cap. Top _AV_MAX_TICKERS use Alpha Vantage
-        # (pre-computed per-ticker sentiment, capped at 50 tickers by AV free tier).
-        # Remaining tickers fall back to the Alpaca News API.
-        # If yfinance is unavailable, fall back to original list order but still
-        # hard-cap at _AV_MAX_TICKERS so we never exceed the AV parameter limit.
-        try:
-            caps = self._fundamentals.get_market_caps(self._tickers)
-            sorted_tickers = sorted(
-                self._tickers, key=lambda t: caps.get(t, 0.0), reverse=True
-            )
-        except Exception as exc:
-            logger.warning(
-                "engine.sentiment_job.cap_fetch_failed",
-                error=str(exc),
-                hint="falling back to original ticker order",
-            )
-            sorted_tickers = list(self._tickers)
-
-        # Hard cap: never send more than _AV_MAX_TICKERS to AV regardless of how
-        # many tickers are in the universe (AV free tier rejects >50 with
-        # "Invalid inputs").
-        av_tickers = sorted_tickers[:_AV_MAX_TICKERS]
-        alpaca_tickers = sorted_tickers[_AV_MAX_TICKERS:]
-
         logger.info(
             "engine.sentiment_job.start",
-            calls_today=count,
-            n_av=len(av_tickers),
-            n_alpaca=len(alpaca_tickers),
-            av_tickers=av_tickers,
+            n_tickers=len(self._tickers),
         )
         try:
             results = self._llm.run_pipeline(
                 self._tickers,
                 self._av_client,
                 self._storage,
-                av_tickers=av_tickers,
+                av_tickers=[],           # empty → skip AV, all tickers via Alpaca
                 alpaca_client=self._alpaca_news,
             )
             logger.info(
@@ -795,12 +861,33 @@ class TradingEngine:
         buys  = [o for o in orders if o["action"] == "buy"]
         n_executed = n_skipped = n_errors = 0
 
+        # Pre-fetch today's filled buys to avoid Pattern Day Trader (PDT) rejections.
+        # Selling a position opened the same day triggers Alpaca error 40310100 on
+        # accounts with < $25 K equity.  We skip such sells proactively rather than
+        # submitting orders we know will be rejected.
+        same_day_buys: set[str] = self._executor.get_todays_filled_buy_symbols()
+        if same_day_buys:
+            logger.info(
+                "engine.rebalance.same_day_buys_detected",
+                symbols=sorted(same_day_buys),
+            )
+
         # ---- Phase 1: execute all sells first to free up capital ----
         for order in sells:
             ticker = order["ticker"]
             dollar_amount = float(order["dollar_amount"])
 
             try:
+                # PDT pre-check: skip same-day sells to avoid Alpaca error 40310100.
+                if ticker in same_day_buys:
+                    logger.warning(
+                        "engine.rebalance.pdt_skip",
+                        ticker=ticker,
+                        reason="position_opened_today",
+                    )
+                    n_skipped += 1
+                    continue
+
                 quote = self._alpaca.get_latest_quote(ticker)
                 price = float(quote["mid"])
                 if price <= 0:
@@ -849,13 +936,24 @@ class TradingEngine:
                 )
 
             except Exception as exc:
-                n_errors += 1
-                logger.error(
-                    "engine.rebalance.order_failed",
-                    ticker=ticker,
-                    action="sell",
-                    error=str(exc),
-                )
+                exc_str = str(exc)
+                # Reactive fallback: PDT rejection from Alpaca (error code 40310100).
+                # Downgrade to warning + skip so a PDT block doesn't inflate n_errors.
+                if "40310100" in exc_str:
+                    n_skipped += 1
+                    logger.warning(
+                        "engine.rebalance.pdt_skip",
+                        ticker=ticker,
+                        reason="pattern_day_trader_protection",
+                    )
+                else:
+                    n_errors += 1
+                    logger.error(
+                        "engine.rebalance.order_failed",
+                        ticker=ticker,
+                        action="sell",
+                        error=exc_str,
+                    )
 
         # ---- Phase 2: re-fetch cash after sells, then execute buys ----
         try:
@@ -1057,6 +1155,11 @@ class TradingEngine:
             minute=31,
             timezone=_ET,
             id="market_open_job",
+            # Fire immediately at engine startup so weights are refreshed with
+            # the latest MWU decisions on every restart, not just at 09:31 ET.
+            # _execute_rebalance_orders() is guarded by is_market_open(), so
+            # no orders are placed outside trading hours.
+            next_run_time=datetime.now(tz=timezone.utc),
         )
         self._scheduler.add_job(
             self.eod_job,

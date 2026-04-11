@@ -321,6 +321,16 @@ class HMMRegimeDetector:
                     ticker=self._ticker,
                     buffer_size=len(self._online_buffer),
                 )
+                # Create a fresh model instance so hmmlearn doesn't warn
+                # "will be overwritten" when fitting an already-fitted model.
+                # We're doing a full cold refit from the buffer, so we don't
+                # want to warm-start from old parameters anyway.
+                self.model = GaussianHMM(
+                    n_components=self.n_states,
+                    n_iter=self.n_iter,
+                    covariance_type=self.covariance_type,
+                    random_state=42,
+                )
                 self.model.fit(X)
                 self.is_fitted = True
                 self._assign_state_labels(X)
