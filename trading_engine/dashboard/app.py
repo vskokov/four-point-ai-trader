@@ -313,6 +313,10 @@ def _render_equity_chart(
         st.info("Portfolio history unavailable. Check Alpaca credentials.")
         return
 
+    # Convert all timestamps to ET so the x-axis shows New York market time.
+    history_df = history_df.copy()
+    history_df["time"] = history_df["time"].dt.tz_convert("America/New_York")
+
     fig = go.Figure()
 
     # ---- Equity line ----
@@ -343,7 +347,7 @@ def _render_equity_chart(
         time_min = history_df["time"].min()
         time_max = history_df["time"].max()
 
-        t_col = pd.to_datetime(trades_df["time"], utc=True)
+        t_col = pd.to_datetime(trades_df["time"], utc=True).dt.tz_convert("America/New_York")
         mask = (t_col >= time_min) & (t_col <= time_max)
         in_range = trades_df[mask].copy()
         # Keep timezone by using a list of Timestamps rather than .values
@@ -360,7 +364,7 @@ def _render_equity_chart(
         def _nearest_equity(t: pd.Timestamp) -> float:
             ts = pd.Timestamp(t)
             if ts.tzinfo is None:
-                ts = ts.tz_localize("UTC")
+                ts = ts.tz_localize("America/New_York")
             idx = (history_df["time"] - ts).abs().idxmin()
             return float(history_df.loc[idx, "equity"])
 
@@ -402,7 +406,7 @@ def _render_equity_chart(
     y_pad = max((eq_max - eq_min) * 0.10, eq_max * 0.002)
 
     fig.update_layout(
-        title=dict(text=f"Portfolio Equity — {period_label}", font=dict(size=14)),
+        title=dict(text=f"Portfolio Equity — {period_label} (ET)", font=dict(size=14)),
         xaxis_title=None,
         yaxis_title="Equity ($)",
         yaxis_tickformat="$,.0f",
