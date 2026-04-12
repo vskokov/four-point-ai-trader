@@ -80,6 +80,16 @@ class TestOHLCV:
     def test_insert_empty_noop(self, storage) -> None:
         assert storage.insert_ohlcv([]) == 0
 
+    def test_insert_duplicate_returns_reduced_count(self, storage) -> None:
+        # Use offsets not used by any other test in this class to avoid
+        # session-scoped DB state collisions
+        rows = [_ohlcv_row(i) for i in range(30, 33)]
+        first = storage.insert_ohlcv(rows)
+        assert first == 3
+        # Re-submitting the same rows must return 0 — all are duplicates
+        second = storage.insert_ohlcv(rows)
+        assert second == 0
+
     def test_query_returns_dataframe(self, storage) -> None:
         storage.insert_ohlcv([_ohlcv_row(10)])
         start = _NOW - timedelta(hours=1)

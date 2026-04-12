@@ -233,7 +233,7 @@ class Storage:
         Returns
         -------
         int
-            Number of rows inserted.
+            Number of rows actually inserted (duplicates are silently skipped).
         """
         if not rows:
             return 0
@@ -242,12 +242,16 @@ class Storage:
             INSERT INTO ohlcv (time, ticker, open, high, low, close, volume)
             VALUES (:time, :ticker, :open, :high, :low, :close, :volume)
             ON CONFLICT DO NOTHING
+            RETURNING time
             """
         )
+        inserted = 0
         with self._engine.begin() as conn:
-            conn.execute(stmt, rows)
-        logger.info("storage.insert_ohlcv", count=len(rows))
-        return len(rows)
+            for row in rows:
+                result = conn.execute(stmt, row)
+                inserted += len(result.fetchall())
+        logger.info("storage.insert_ohlcv", submitted=len(rows), inserted=inserted)
+        return inserted
 
     def query_ohlcv(
         self,
