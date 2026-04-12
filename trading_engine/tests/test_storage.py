@@ -37,13 +37,11 @@ def storage():
 
     configure_logging("DEBUG")
     s = Storage(TEST_DB_URL)  # type: ignore[arg-type]
+    # Pre-clean: ensure no leftover data from a prior interrupted run
+    _clean_test_data(s)
     yield s
     # Teardown: drop test data so the suite is idempotent
-    with s._engine.begin() as conn:
-        conn.execute(__import__("sqlalchemy").text("DELETE FROM ohlcv WHERE ticker = 'TEST'"))
-        conn.execute(__import__("sqlalchemy").text("DELETE FROM news WHERE ticker = 'TEST'"))
-        conn.execute(__import__("sqlalchemy").text("DELETE FROM signal_log WHERE ticker = 'TEST'"))
-        conn.execute(__import__("sqlalchemy").text("DELETE FROM regime_log WHERE ticker = 'TEST'"))
+    _clean_test_data(s)
     s.dispose()
 
 
@@ -52,6 +50,17 @@ def storage():
 # ---------------------------------------------------------------------------
 
 _NOW = datetime.now(tz=timezone.utc).replace(microsecond=0)
+
+
+def _clean_test_data(s) -> None:  # type: ignore[type-arg]
+    """Delete all rows written by this test suite (TEST and TEST2 tickers)."""
+    from sqlalchemy import text
+
+    with s._engine.begin() as conn:
+        conn.execute(text("DELETE FROM ohlcv WHERE ticker = 'TEST'"))
+        conn.execute(text("DELETE FROM news WHERE ticker IN ('TEST', 'TEST2')"))
+        conn.execute(text("DELETE FROM signal_log WHERE ticker = 'TEST'"))
+        conn.execute(text("DELETE FROM regime_log WHERE ticker = 'TEST'"))
 
 
 def _ohlcv_row(offset_minutes: int = 0) -> dict:
