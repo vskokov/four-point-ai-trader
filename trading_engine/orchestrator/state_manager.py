@@ -150,49 +150,79 @@ class StateManager:
             tickers=state.get("tickers"),
         )
 
-    def load(self) -> dict[str, Any] | None:
+    def _try_load_path(self, path: Path) -> dict[str, Any] | None:
         """
-        Load and validate the current state snapshot.
+        Attempt to read and validate a single state file.
 
-        Returns
-        -------
-        dict
-            The stored state (without ``checksum`` and ``version`` keys), or
-            *None* if the file does not exist.
-
-        Raises
-        ------
-        ValueError
-            If the checksum is invalid (file is corrupted).
+        Returns the decoded state dict (without internal metadata keys) on
+        success, or *None* when the file does not exist, cannot be parsed, or
+        fails checksum validation.
         """
-        path = self._state_path()
         if not path.exists():
-            logger.info("state_manager.no_state_file", path=str(path))
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data: dict[str, Any] = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "state_manager.read_error",
+                path=str(path),
+                error=str(exc),
+            )
             return None
 
-        raw = path.read_text(encoding="utf-8")
-        data: dict[str, Any] = json.loads(raw)
-
         if not self._verify(data):
-            logger.error(
+            logger.warning(
                 "state_manager.checksum_mismatch",
                 path=str(path),
                 stored=data.get("checksum"),
             )
-            raise ValueError(f"State file checksum mismatch: {path}")
+            return None
 
-        logger.info(
-            "state_manager.loaded",
-            path=str(path),
-            version=data.get("version"),
-            saved_at=data.get("saved_at"),
-        )
-        # Return without internal metadata
         return {
             k: v
             for k, v in data.items()
             if k not in {"checksum", "version", "saved_at"}
         }
+
+    def load(self) -> dict[str, Any] | None:
+        """
+        Load and validate the current state snapshot, falling back through
+        rolling backups (bak1 → bak2 → bak3) if the current file is absent
+        or corrupted.
+
+        Returns
+        -------
+        dict
+            The stored state (without ``checksum``, ``version``, and
+            ``saved_at`` keys), or *None* if no valid snapshot exists.
+        """
+        candidates: list[Path] = [self._state_path()] + [
+            self._backup_path(n) for n in range(1, _MAX_BACKUPS + 1)
+        ]
+
+        for path in candidates:
+            state = self._try_load_path(path)
+            if state is not None:
+                if path != self._state_path():
+                    logger.warning(
+                        "state_manager.recovered_from_backup",
+                        backup=str(path),
+                        hint="current state file was absent or corrupted",
+                    )
+                else:
+                    logger.info(
+                        "state_manager.loaded",
+                        path=str(path),
+                    )
+                return state
+
+        logger.error(
+            "state_manager.all_candidates_failed",
+            candidates=[str(p) for p in candidates],
+            hint="no valid state snapshot found; engine will start from defaults",
+        )
+        return None
 
     def list_backups(self) -> list[Path]:
         """Return existing backup paths in order (bak1 = most recent)."""

@@ -270,6 +270,11 @@ class TradingEngine:
         self._stable_regime_label: dict[str, str] = {
             t: "neutral" for t in self._tickers
         }
+        # Smoothed regime *index* — must stay in sync with _stable_regime_label
+        # so the regime row used by MWU matches the displayed/smoothed label.
+        self._stable_regime: dict[str, int] = {
+            t: 1 for t in self._tickers  # 1 = neutral default
+        }
 
         # Holding period: track the last non-zero signal and when it changed
         # direction so reversals within _MIN_HOLD_MINUTES can be suppressed.
@@ -290,11 +295,7 @@ class TradingEngine:
 
     def _load_state(self) -> None:
         """Restore engine metadata from the last saved snapshot (if any)."""
-        try:
-            state = self._state_manager.load()
-        except ValueError as exc:
-            logger.error("engine.state_load_failed", error=str(exc))
-            state = None
+        state = self._state_manager.load()
 
         if state is None:
             return
@@ -661,15 +662,22 @@ class TradingEngine:
         _hist = self._regime_history[ticker]
         if len(_hist) == _REGIME_SMOOTH_WINDOW and len(set(_hist)) == 1:
             self._stable_regime_label[ticker] = _hist[0]
+            # Keep the stable regime *index* in sync so that MWU reads from the
+            # same row that the smoothed label represents.
+            self._stable_regime[ticker] = regime
         smoothed_label = self._stable_regime_label[ticker]
+        smoothed_regime = self._stable_regime[ticker]
         if smoothed_label != regime_label:
             logger.debug(
                 "engine.regime_smoothed",
                 ticker=ticker,
                 raw_label=regime_label,
+                raw_regime=regime,
                 smoothed_label=smoothed_label,
+                smoothed_regime=smoothed_regime,
             )
             regime_label = smoothed_label
+            regime = smoothed_regime
             direction = _REGIME_TO_SIGNAL.get(smoothed_label, 0)
             hmm_signal = {"signal": direction, "confidence": hmm_signal["confidence"]}
 

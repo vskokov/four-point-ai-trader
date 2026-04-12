@@ -361,7 +361,7 @@ class MWUMetaAgent:
         decision_time: datetime,
         horizon_bars: int = 1,
         storage: Any = None,
-    ) -> int:
+    ) -> int | None:
         """
         Determine the realised price direction after *horizon_bars* bars.
 
@@ -380,8 +380,12 @@ class MWUMetaAgent:
 
         Returns
         -------
-        int
+        int or None
             +1 if price rose, −1 if price fell, 0 if change < 0.05 %.
+            *None* when outcome data is unavailable (no storage, empty data,
+            or insufficient bars around the decision time).  Callers must
+            treat *None* as "unknown outcome" and skip any weight update —
+            it must never be conflated with a genuine flat move (0).
         """
         if storage is None:
             logger.warning(
@@ -389,7 +393,7 @@ class MWUMetaAgent:
                 ticker=ticker,
                 decision_time=str(decision_time),
             )
-            return 0
+            return None
 
         # Fetch a generous window around the decision time
         start = decision_time - timedelta(minutes=5)
@@ -403,7 +407,7 @@ class MWUMetaAgent:
                 ticker=ticker,
                 decision_time=str(decision_time),
             )
-            return 0
+            return None
 
         # Ensure timezone-aware comparison
         if df["time"].dt.tz is None:
@@ -424,7 +428,7 @@ class MWUMetaAgent:
                 n_before=len(before),
                 n_after=len(after),
             )
-            return 0
+            return None
 
         price_at = float(before.iloc[-1]["close"])
         # Take the close horizon_bars ahead
@@ -597,12 +601,22 @@ class MWUMetaAgent:
                     horizon_bars=pending["horizon_bars"],
                     storage=storage,
                 )
-                self.update_weights(
-                    ticker=key[0],
-                    signals_t=pending["signals_t"],
-                    regime_t=pending["regime_t"],
-                    actual_direction=actual,
-                )
+                if actual is None:
+                    # Outcome data unavailable — skip update to avoid penalising
+                    # signals for missing market data (e.g. DB outage, data gap).
+                    logger.warning(
+                        "mwu.scheduled_update.outcome_unavailable",
+                        ticker=key[0],
+                        decision_time=str(dec_time),
+                        reason="get_actual_direction returned None; skipping weight update",
+                    )
+                else:
+                    self.update_weights(
+                        ticker=key[0],
+                        signals_t=pending["signals_t"],
+                        regime_t=pending["regime_t"],
+                        actual_direction=actual,
+                    )
                 keys_to_remove.append(key)
 
         for key in keys_to_remove:

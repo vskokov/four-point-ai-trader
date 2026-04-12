@@ -498,21 +498,24 @@ class TestGetActualDirection:
         result = agent.get_actual_direction("AAPL", base, horizon_bars=1, storage=storage)
         assert result == 0
 
-    def test_no_storage_returns_zero(self, tmp_path: Path) -> None:
+    def test_no_storage_returns_none(self, tmp_path: Path) -> None:
+        """No storage → unknown outcome → None (not a penalising 0)."""
         agent = _make_agent(tmp_path)
         base = datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
         result = agent.get_actual_direction("AAPL", base, storage=None)
-        assert result == 0
+        assert result is None
 
-    def test_empty_dataframe_returns_zero(self, tmp_path: Path) -> None:
+    def test_empty_dataframe_returns_none(self, tmp_path: Path) -> None:
+        """Empty OHLCV → unknown outcome → None (not a penalising 0)."""
         agent = _make_agent(tmp_path)
         base = datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
         storage = MagicMock()
         storage.query_ohlcv.return_value = pd.DataFrame()
         result = agent.get_actual_direction("AAPL", base, storage=storage)
-        assert result == 0
+        assert result is None
 
-    def test_no_bars_after_decision_returns_zero(self, tmp_path: Path) -> None:
+    def test_no_bars_after_decision_returns_none(self, tmp_path: Path) -> None:
+        """Only pre-decision bars → insufficient bars → None (not a penalising 0)."""
         agent = _make_agent(tmp_path)
         base = datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
         storage = MagicMock()
@@ -530,7 +533,7 @@ class TestGetActualDirection:
         )
         storage.query_ohlcv.return_value = df
         result = agent.get_actual_direction("AAPL", base, storage=storage)
-        assert result == 0
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -658,3 +661,242 @@ class TestScheduledUpdate:
         agent.scheduled_update("AAPL", _bull_signals(), regime=0)
         for r in range(3):
             assert abs(agent.weights[r].sum() - 1.0) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# get_actual_direction() — Fix 3: None for unavailable outcome data
+# ---------------------------------------------------------------------------
+
+class TestGetActualDirectionNone:
+    """Verify that unavailable outcome data produces None, not a penalising 0."""
+
+    def _past_bar_df(self, decision_time: datetime) -> pd.DataFrame:
+        """Return a minimal OHLCV DataFrame with bars before and after decision_time."""
+        before_t = decision_time - timedelta(minutes=1)
+        after_t  = decision_time + timedelta(minutes=1)
+        return pd.DataFrame(
+            {
+                "time":  [before_t, after_t],
+                "open":  [100.0, 100.1],
+                "high":  [101.0, 101.1],
+                "low":   [99.0,  99.1],
+                "close": [100.0, 100.15],
+                "volume": [1000, 1000],
+            }
+        )
+
+    def test_no_storage_returns_none(self, tmp_path: Path) -> None:
+        agent = _make_agent(tmp_path)
+        result = agent.get_actual_direction(
+            "AAPL", datetime.now(tz=timezone.utc), storage=None
+        )
+        assert result is None
+
+    def test_empty_ohlcv_returns_none(self, tmp_path: Path) -> None:
+        agent = _make_agent(tmp_path)
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = pd.DataFrame()
+        result = agent.get_actual_direction(
+            "AAPL", datetime.now(tz=timezone.utc), storage=storage
+        )
+        assert result is None
+
+    def test_only_before_bars_returns_none(self, tmp_path: Path) -> None:
+        """No bars after decision_time → insufficient bars → None."""
+        agent = _make_agent(tmp_path)
+        decision_time = datetime.now(tz=timezone.utc)
+        before_t = decision_time - timedelta(minutes=1)
+        df = pd.DataFrame(
+            {
+                "time":   [before_t],
+                "open":   [100.0],
+                "high":   [101.0],
+                "low":    [99.0],
+                "close":  [100.0],
+                "volume": [1000],
+            }
+        )
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = df
+        result = agent.get_actual_direction(
+            "AAPL", decision_time, storage=storage
+        )
+        assert result is None
+
+    def test_only_after_bars_returns_none(self, tmp_path: Path) -> None:
+        """No bars at or before decision_time → insufficient bars → None."""
+        agent = _make_agent(tmp_path)
+        decision_time = datetime.now(tz=timezone.utc)
+        after_t = decision_time + timedelta(minutes=1)
+        df = pd.DataFrame(
+            {
+                "time":   [after_t],
+                "open":   [100.0],
+                "high":   [101.0],
+                "low":    [99.0],
+                "close":  [100.0],
+                "volume": [1000],
+            }
+        )
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = df
+        result = agent.get_actual_direction(
+            "AAPL", decision_time, storage=storage
+        )
+        assert result is None
+
+    def test_genuine_flat_move_returns_zero(self, tmp_path: Path) -> None:
+        """A real price change < 0.05 % must still return 0 (not None)."""
+        agent = _make_agent(tmp_path)
+        decision_time = datetime(2025, 1, 15, 14, 30, tzinfo=timezone.utc)
+        before_t = decision_time - timedelta(minutes=1)
+        after_t  = decision_time + timedelta(minutes=1)
+        # 0.0001% change — well below the 0.05% threshold
+        df = pd.DataFrame(
+            {
+                "time":   [before_t, after_t],
+                "open":   [100.0, 100.0],
+                "high":   [100.1, 100.1],
+                "low":    [99.9,  99.9],
+                "close":  [100.0, 100.0001],
+                "volume": [1000, 1000],
+            }
+        )
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = df
+        result = agent.get_actual_direction(
+            "AAPL", decision_time, storage=storage
+        )
+        assert result == 0
+
+    def test_genuine_up_move_returns_one(self, tmp_path: Path) -> None:
+        agent = _make_agent(tmp_path)
+        decision_time = datetime(2025, 1, 15, 14, 30, tzinfo=timezone.utc)
+        before_t = decision_time - timedelta(minutes=1)
+        after_t  = decision_time + timedelta(minutes=1)
+        df = pd.DataFrame(
+            {
+                "time":   [before_t, after_t],
+                "close":  [100.0, 101.0],
+                "open":   [100.0, 100.5],
+                "high":   [101.0, 102.0],
+                "low":    [99.0,  100.0],
+                "volume": [1000, 1000],
+            }
+        )
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = df
+        result = agent.get_actual_direction(
+            "AAPL", decision_time, storage=storage
+        )
+        assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# scheduled_update() — Fix 3: skips update_weights when outcome is None
+# ---------------------------------------------------------------------------
+
+class TestScheduledUpdateOutcomeUnavailable:
+    """Verify that missing outcome data does not trigger weight penalisation."""
+
+    def _inject_past_pending(
+        self,
+        agent: MWUMetaAgent,
+        ticker: str = "AAPL",
+        minutes_ago: int = 10,
+    ) -> tuple[str, str]:
+        """Inject an expired pending entry and return its key."""
+        past_time = datetime.now(tz=timezone.utc) - timedelta(minutes=minutes_ago)
+        decision = {
+            "ticker":       ticker,
+            "final_signal": 1,
+            "score":        0.5,
+            "regime":       1,
+            "weights":      {},
+            "timestamp":    past_time,
+        }
+        key = (ticker, past_time.isoformat())
+        agent._pending[key] = {
+            "decision":    decision,
+            "signals_t":   _bull_signals(),
+            "regime_t":    1,
+            "horizon_bars": 1,
+        }
+        return key
+
+    def test_update_weights_not_called_when_no_storage(
+        self, tmp_path: Path
+    ) -> None:
+        """No storage → outcome is None → update_weights must NOT be called."""
+        agent = _make_agent(tmp_path)
+        self._inject_past_pending(agent)
+        weights_before = agent.weights.copy()
+
+        agent.scheduled_update("AAPL", _bull_signals(), regime=1, storage=None)
+
+        np.testing.assert_array_equal(agent.weights, weights_before)
+
+    def test_update_weights_not_called_when_empty_ohlcv(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty OHLCV → outcome is None → update_weights must NOT be called."""
+        agent = _make_agent(tmp_path)
+        self._inject_past_pending(agent)
+        weights_before = agent.weights.copy()
+
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = pd.DataFrame()
+
+        agent.scheduled_update("AAPL", _bull_signals(), regime=1, storage=storage)
+
+        np.testing.assert_array_equal(agent.weights, weights_before)
+
+    def test_pending_entry_removed_when_outcome_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """Expired entry is still removed even when outcome is unavailable."""
+        agent = _make_agent(tmp_path)
+        key = self._inject_past_pending(agent)
+
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = pd.DataFrame()
+
+        agent.scheduled_update("AAPL", _bull_signals(), regime=1, storage=storage)
+
+        assert key not in agent._pending
+
+    def test_update_weights_called_for_genuine_flat_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """A genuine flat outcome (0) must still trigger update_weights.
+
+        When all signals predict +1 but the actual move is 0 (flat), all
+        signal losses are 1.0.  Because all weights are multiplied by the
+        same factor exp(-eta * 1.0), renormalisation leaves the ratios
+        unchanged — but the _update_log must grow to prove update_weights ran.
+        """
+        agent = _make_agent(tmp_path)
+        key = self._inject_past_pending(agent)
+
+        decision_time = agent._pending[key]["decision"]["timestamp"]
+        before_t = decision_time - timedelta(minutes=1)
+        after_t  = decision_time + timedelta(minutes=1)
+        df = pd.DataFrame(
+            {
+                "time":   [before_t, after_t],
+                "close":  [100.0, 100.0],
+                "open":   [100.0, 100.0],
+                "high":   [100.0, 100.0],
+                "low":    [100.0, 100.0],
+                "volume": [1000, 1000],
+            }
+        )
+        storage = MagicMock()
+        storage.query_ohlcv.return_value = df
+
+        agent.scheduled_update("AAPL", _bull_signals(), regime=1, storage=storage)
+
+        # update_weights ran: _update_log should have one entry recording the
+        # genuine flat outcome (actual_direction=0).
+        assert len(agent._update_log) == 1
+        assert agent._update_log[0]["actual_direction"] == 0

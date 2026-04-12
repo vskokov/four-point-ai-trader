@@ -219,6 +219,7 @@ def _build_engine(
     all_tickers = list(tickers)
     engine._regime_history = {t: deque(maxlen=_REGIME_SMOOTH_WINDOW) for t in all_tickers}
     engine._stable_regime_label = {t: "neutral" for t in all_tickers}
+    engine._stable_regime = {t: 1 for t in all_tickers}  # 1 = neutral default
     engine._last_active_signal = {t: 0 for t in all_tickers}
     engine._last_signal_change_time = {t: None for t in all_tickers}
 
@@ -559,6 +560,81 @@ class TestRegimeSmoothing:
 
         signals = mwu_map["AAPL"].scheduled_update.call_args[1]["signals"]
         assert signals["hmm_regime"]["signal"] == 1   # bull = +1, not bear = -1
+
+    def test_smoothed_regime_index_sent_to_mwu_on_outlier(self, tmp_path):
+        """MWU regime kwarg must be the smoothed index (2=bull), not the raw outlier (0=bear)."""
+        engine, _, _, mwu_map = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+
+        # Prime stable regime as bull (index=2) with 3 bars.
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+
+        assert engine._stable_regime["AAPL"] == 2
+
+        # One bear outlier — MWU should still receive regime=2 (bull), not regime=0 (bear).
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        mwu_map["AAPL"].scheduled_update.reset_mock()
+        engine.bar_handler(_make_bar("AAPL"))
+
+        regime_passed = mwu_map["AAPL"].scheduled_update.call_args[1]["regime"]
+        assert regime_passed == 2, f"Expected smoothed regime 2 (bull), got {regime_passed}"
+
+    def test_stable_regime_index_updated_after_consecutive_streak(self, tmp_path):
+        """After three consecutive bear bars, _stable_regime must switch to bear index."""
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+
+        # Prime with bull (index=2).
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime["AAPL"] == 2
+
+        # Three consecutive bear bars — stable index must flip to 0.
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+        assert engine._stable_regime["AAPL"] == 0
+
+    def test_single_outlier_does_not_change_stable_regime_index(self, tmp_path):
+        """A single outlier bar must leave _stable_regime unchanged (bull=2 stays)."""
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=0)
+        )
+        engine._hmm["AAPL"].state_labels = {0: "bear", 1: "neutral", 2: "bull"}
+
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 2, "label": "bull", "probs": [0.1, 0.1, 0.8],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        for _ in range(3):
+            engine.bar_handler(_make_bar("AAPL"))
+
+        engine._hmm["AAPL"].predict_regime.return_value = {
+            "regime": 0, "label": "bear", "probs": [0.8, 0.1, 0.1],
+            "timestamp": datetime.now(tz=timezone.utc),
+        }
+        engine.bar_handler(_make_bar("AAPL"))
+
+        assert engine._stable_regime["AAPL"] == 2   # unchanged
 
 
 # ===========================================================================
@@ -938,19 +1014,19 @@ class TestStateManager:
         sm = StateManager(state_dir=tmp_path / "empty")
         assert sm.load() is None
 
-    def test_checksum_mismatch_raises(self, tmp_path):
+    def test_checksum_mismatch_returns_none_when_no_backups(self, tmp_path):
+        """Corrupt current file with no backups → load() returns None (no exception)."""
         from trading_engine.orchestrator.state_manager import StateManager
         sm = StateManager(state_dir=tmp_path)
         sm.save({"tickers": ["AAPL"]})
 
-        # Corrupt the file
+        # Corrupt the current file only — no backups exist yet.
         path = sm._state_path()
         data = json.loads(path.read_text())
         data["checksum"] = "bad_checksum"
         path.write_text(json.dumps(data))
 
-        with pytest.raises(ValueError, match="checksum"):
-            sm.load()
+        assert sm.load() is None
 
     def test_rolling_backup_creates_bak1(self, tmp_path):
         from trading_engine.orchestrator.state_manager import StateManager
@@ -997,6 +1073,61 @@ class TestStateManager:
         assert "checksum" not in loaded
         assert "version" not in loaded
         assert "saved_at" not in loaded
+
+    # ------------------------------------------------------------------
+    # Fix 5: backup-based recovery
+    # ------------------------------------------------------------------
+
+    def _corrupt(self, path: Path) -> None:
+        """Overwrite checksum in a state file to make it invalid."""
+        data = json.loads(path.read_text())
+        data["checksum"] = "corrupted"
+        path.write_text(json.dumps(data))
+
+    def test_recovers_from_bak1_when_current_corrupted(self, tmp_path):
+        """Corrupt current, valid bak1 → load() recovers bak1 contents."""
+        from trading_engine.orchestrator.state_manager import StateManager
+        sm = StateManager(state_dir=tmp_path)
+
+        sm.save({"iteration": 1})   # becomes bak1 on next save
+        sm.save({"iteration": 2})   # current; bak1 holds iteration=1
+
+        self._corrupt(sm._state_path())
+
+        loaded = sm.load()
+        assert loaded is not None
+        assert loaded["iteration"] == 1
+
+    def test_recovers_from_bak2_when_current_and_bak1_corrupted(self, tmp_path):
+        """Corrupt current and bak1, valid bak2 → load() recovers bak2."""
+        from trading_engine.orchestrator.state_manager import StateManager
+        sm = StateManager(state_dir=tmp_path)
+
+        sm.save({"iteration": 1})   # will eventually be bak2
+        sm.save({"iteration": 2})   # will be bak1
+        sm.save({"iteration": 3})   # current; bak1=2, bak2=1
+
+        self._corrupt(sm._state_path())
+        self._corrupt(sm._backup_path(1))
+
+        loaded = sm.load()
+        assert loaded is not None
+        assert loaded["iteration"] == 1
+
+    def test_returns_none_when_all_candidates_corrupted(self, tmp_path):
+        """All files corrupted → load() returns None (no exception)."""
+        from trading_engine.orchestrator.state_manager import StateManager
+        sm = StateManager(state_dir=tmp_path)
+
+        for _ in range(4):
+            sm.save({"data": "x"})
+
+        self._corrupt(sm._state_path())
+        for n in range(1, 4):
+            if sm._backup_path(n).exists():
+                self._corrupt(sm._backup_path(n))
+
+        assert sm.load() is None
 
 
 # ===========================================================================
