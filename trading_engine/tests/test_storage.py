@@ -128,10 +128,27 @@ class TestNews:
         assert inserted == 2
 
     def test_insert_news_deduplication(self, storage) -> None:
+        """Same (ticker, headline_hash) inserted twice → second insert is skipped."""
         row = {"ticker": "TEST", "title": "Duplicate headline gamma"}
         storage.insert_news([row])
         second = storage.insert_news([row])
         assert second == 0
+
+    def test_insert_news_same_hash_different_tickers(self, storage) -> None:
+        """Same headline_hash for two different tickers must both be accepted."""
+        title = "Shared macro headline for dedup test"
+        row_aapl = {"ticker": "TEST",  "title": title}
+        row_msft = {"ticker": "TEST2", "title": title}
+        n1 = storage.insert_news([row_aapl])
+        n2 = storage.insert_news([row_msft])
+        assert n1 == 1, "First ticker insert should succeed"
+        assert n2 == 1, "Second ticker with same hash should also succeed"
+
+    def test_insert_news_same_ticker_same_hash_is_deduped(self, storage) -> None:
+        """True duplicate (same ticker + same hash) is rejected on second insert."""
+        row = {"ticker": "TEST", "title": "Ticker-scoped dedup check"}
+        assert storage.insert_news([row]) == 1
+        assert storage.insert_news([row]) == 0
 
     def test_insert_news_empty(self, storage) -> None:
         assert storage.insert_news([]) == 0

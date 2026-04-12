@@ -40,6 +40,14 @@ _DDL_OHLCV_INDEX = """
 CREATE INDEX IF NOT EXISTS ohlcv_ticker_time_idx ON ohlcv (ticker, time DESC);
 """
 
+# Defense-in-depth: unique constraint on (ticker, time) prevents duplicate live
+# bars even if the insertion path is accidentally called twice.  TimescaleDB
+# supports UNIQUE constraints that include the partition column (time).
+_DDL_OHLCV_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS ohlcv_ticker_time_unique
+    ON ohlcv (ticker, time);
+"""
+
 _DDL_NEWS = """
 CREATE TABLE IF NOT EXISTS news (
     id                  SERIAL          PRIMARY KEY,
@@ -51,8 +59,21 @@ CREATE TABLE IF NOT EXISTS news (
     sentiment_score     FLOAT,
     sentiment_confidence FLOAT,
     llm_direction       INT,
-    headline_hash       TEXT            UNIQUE NOT NULL
+    headline_hash       TEXT            NOT NULL,
+    UNIQUE (ticker, headline_hash)
 );
+"""
+
+# Migration: replace the old global UNIQUE(headline_hash) constraint with a
+# per-ticker composite UNIQUE(ticker, headline_hash).  Both statements are
+# idempotent — safe to run on fresh DBs and on existing deployments.
+_DDL_NEWS_MIGRATE_UNIQUE = """
+ALTER TABLE news DROP CONSTRAINT IF EXISTS news_headline_hash_key;
+"""
+
+_DDL_NEWS_UNIQUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS news_ticker_headline_hash_idx
+    ON news (ticker, headline_hash);
 """
 
 _DDL_SIGNAL_LOG = """
@@ -161,7 +182,10 @@ class Storage:
             conn.execute(text(_DDL_OHLCV))
             conn.execute(text(_DDL_OHLCV_HYPERTABLE))
             conn.execute(text(_DDL_OHLCV_INDEX))
+            conn.execute(text(_DDL_OHLCV_UNIQUE))
             conn.execute(text(_DDL_NEWS))
+            conn.execute(text(_DDL_NEWS_MIGRATE_UNIQUE))
+            conn.execute(text(_DDL_NEWS_UNIQUE_INDEX))
             conn.execute(text(_DDL_SIGNAL_LOG))
             conn.execute(text(_DDL_SIGNAL_LOG_HYPERTABLE))
             conn.execute(text(_DDL_REGIME_LOG))
@@ -274,7 +298,7 @@ class Storage:
                 (:fetched_at, :ticker, :title, :summary, :source,
                  :sentiment_score, :sentiment_confidence, :llm_direction,
                  :headline_hash)
-            ON CONFLICT (headline_hash) DO NOTHING
+            ON CONFLICT (ticker, headline_hash) DO NOTHING
             RETURNING id
             """
         )

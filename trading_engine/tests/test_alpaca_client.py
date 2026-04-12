@@ -355,6 +355,73 @@ class TestStreamBars:
             client.stop_stream()
             MockStream.return_value.stop.assert_called_once()
 
+    def test_stream_callback_does_not_persist(self, mock_storage, mock_settings):
+        """stream_bars must NOT call insert_ohlcv — bar_handler is the sole writer."""
+        import asyncio
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS) as MockStream,
+            patch(_TRADING_CLIENT),
+            patch("threading.Thread"),
+        ):
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+            callback = MagicMock()
+            client.stream_bars(["AAPL"], callback)
+
+            # Capture the async handler passed to subscribe_bars
+            handler = MockStream.return_value.subscribe_bars.call_args[0][0]
+
+            # Build a fake bar object
+            fake_bar = SimpleNamespace(
+                timestamp=_START,
+                symbol="AAPL",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=1000,
+            )
+
+            asyncio.run(handler(fake_bar))
+
+            # Storage must NOT have been written inside the stream callback
+            mock_storage.insert_ohlcv.assert_not_called()
+
+            # The user callback must have received the bar as a plain dict
+            callback.assert_called_once()
+            row = callback.call_args[0][0]
+            assert row["ticker"] == "AAPL"
+            assert row["close"] == 100.5
+
+    def test_stream_callback_forwards_bar_shape(self, mock_storage, mock_settings):
+        """Callback receives all seven expected OHLCV fields."""
+        import asyncio
+
+        with (
+            patch(_HIST_CLIENT),
+            patch(_STREAM_CLASS) as MockStream,
+            patch(_TRADING_CLIENT),
+            patch("threading.Thread"),
+        ):
+            from trading_engine.data.alpaca_client import AlpacaMarketData
+            client = AlpacaMarketData(mock_storage)
+            rows_received: list[dict] = []
+            client.stream_bars(["MSFT"], rows_received.append)
+
+            handler = MockStream.return_value.subscribe_bars.call_args[0][0]
+            fake_bar = SimpleNamespace(
+                timestamp=_START, symbol="MSFT",
+                open=200.0, high=205.0, low=198.0, close=203.0, volume=500,
+            )
+            asyncio.run(handler(fake_bar))
+
+            assert len(rows_received) == 1
+            row = rows_received[0]
+            assert set(row.keys()) == {"time", "ticker", "open", "high", "low", "close", "volume"}
+            assert row["volume"] == 500
+
 
 # ---------------------------------------------------------------------------
 # Retry logic

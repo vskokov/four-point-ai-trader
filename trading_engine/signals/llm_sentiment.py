@@ -138,8 +138,10 @@ class LLMSentimentSignal:
         self.min_relevance = min_relevance
         # 60-second timeout is enforced at the httpx layer inside the client.
         self._client = ollama.Client(host=host, timeout=60)
-        # In-process cache: headline_hashes already scored this session.
-        self._seen_hashes: set[str] = set()
+        # In-process cache: (ticker, headline_hash) pairs already scored this
+        # session.  Keyed per-ticker so a shared article can be scored once per
+        # ticker rather than being suppressed after the first ticker processes it.
+        self._seen_hashes: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -508,12 +510,14 @@ class LLMSentimentSignal:
             articles = articles_by_ticker.get(ticker, [])
             n_fetched = len(articles)
 
-            # 2. Deduplicate against in-process cache
+            # 2. Deduplicate against in-process cache.
+            # Key is (ticker, headline_hash) so a shared article can be scored
+            # once per ticker; processing AAPL does not suppress it for MSFT.
             new_articles: list[dict[str, Any]] = []
             n_skipped = 0
             for article in articles:
                 h = article.get("headline_hash", "")
-                if h and h in self._seen_hashes:
+                if h and (ticker, h) in self._seen_hashes:
                     n_skipped += 1
                 else:
                     new_articles.append(article)
@@ -532,7 +536,7 @@ class LLMSentimentSignal:
             direction  = score_result["direction"]
             confidence = score_result["confidence"]
 
-            # 4. Persist news rows (storage deduplicates via headline_hash UNIQUE)
+            # 4. Persist news rows (storage deduplicates via UNIQUE(ticker, headline_hash))
             if new_articles:
                 news_rows = [
                     {
@@ -549,11 +553,11 @@ class LLMSentimentSignal:
                 ]
                 storage.insert_news(news_rows)
 
-            # Update in-process dedup cache
+            # Update in-process dedup cache with (ticker, headline_hash) pairs
             for a in new_articles:
                 h = a.get("headline_hash", "")
                 if h:
-                    self._seen_hashes.add(h)
+                    self._seen_hashes.add((ticker, h))
 
             # 5. Signal log: signed confidence = direction × confidence
             # Store a condensed snapshot of contributing headlines so the

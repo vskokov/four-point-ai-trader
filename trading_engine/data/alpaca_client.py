@@ -349,10 +349,10 @@ class AlpacaMarketData:
         """
         Start a WebSocket bar stream in a background daemon thread.
 
-        On each incoming bar the record is:
-          1. Persisted via ``insert_ohlcv()``.
-          2. Forwarded to *callback* as a plain dict (same shape as
-             ``fetch_historical_ohlcv`` records).
+        On each incoming bar the record is forwarded to *callback* as a plain
+        dict (same shape as ``fetch_historical_ohlcv`` records).  Persistence
+        is the caller's responsibility — ``TradingEngine.bar_handler`` is the
+        single authoritative writer for live bars.
 
         The stream runs until the process exits (daemon thread) or
         ``stop_stream()`` is called.
@@ -374,7 +374,6 @@ class AlpacaMarketData:
                 "close":  float(bar.close),
                 "volume": int(bar.volume),
             }
-            self._storage.insert_ohlcv([row])
             callback(row)
 
         self._stream.subscribe_bars(_handler, *tickers)

@@ -543,9 +543,10 @@ class TestRunPipeline:
         assert abs(storage.signal_rows[0]["value"] - 1 * 0.85) < 1e-9
 
     def test_deduplication_skips_seen_hash(self, sig: Any) -> None:
-        """Articles whose headline_hash is already in _seen_hashes are skipped."""
+        """Articles whose (ticker, headline_hash) is already in _seen_hashes are skipped."""
         article = _make_article()
-        sig._seen_hashes.add(article["headline_hash"])
+        # Cache key is now a (ticker, hash) tuple
+        sig._seen_hashes.add(("AAPL", article["headline_hash"]))
 
         storage = _FakeStorage()
         av = self._av_client([article])
@@ -557,14 +558,65 @@ class TestRunPipeline:
         assert storage.signal_rows[0]["value"] == 0.0
 
     def test_deduplication_adds_new_hash_to_seen(self, sig: Any) -> None:
-        """After processing, the article's hash must be in _seen_hashes."""
+        """After processing, (ticker, hash) must be in _seen_hashes."""
         _set_llm_response(sig, _VALID_LLM_RESPONSE)
         article = _make_article()
         storage = _FakeStorage()
         av = self._av_client([article])
-        assert article["headline_hash"] not in sig._seen_hashes
+        assert ("AAPL", article["headline_hash"]) not in sig._seen_hashes
         sig.run_pipeline(["AAPL"], av, storage)
-        assert article["headline_hash"] in sig._seen_hashes
+        assert ("AAPL", article["headline_hash"]) in sig._seen_hashes
+
+    def test_shared_article_scored_for_both_tickers(self, sig: Any) -> None:
+        """A shared article (same headline_hash, two tickers) must be scored for each ticker."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorage()
+        # Same headline text → same hash, but assigned to two different tickers
+        shared_hash = _make_article(title="Macro headline")["headline_hash"]
+        av = MagicMock()
+        av.fetch_news.return_value = [
+            _make_article(title="Macro headline", ticker="AAPL"),
+            _make_article(title="Macro headline", ticker="MSFT"),
+        ]
+        results = sig.run_pipeline(["AAPL", "MSFT"], av, storage)
+
+        # Both tickers must produce a signal row
+        scored_tickers = {r["ticker"] for r in results}
+        assert "AAPL" in scored_tickers
+        assert "MSFT" in scored_tickers
+
+        # Both news rows must have been forwarded to storage
+        stored_tickers = {r["ticker"] for r in storage.news_rows}
+        assert "AAPL" in stored_tickers
+        assert "MSFT" in stored_tickers
+
+        # Both (ticker, hash) pairs must be in the dedup cache
+        assert ("AAPL", shared_hash) in sig._seen_hashes
+        assert ("MSFT", shared_hash) in sig._seen_hashes
+
+    def test_aapl_seen_hash_does_not_suppress_msft(self, sig: Any) -> None:
+        """Processing AAPL first must not suppress the same article for MSFT."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        article_hash = _make_article(title="Shared macro")["headline_hash"]
+        # Pre-populate cache as if AAPL was already processed in a prior run
+        sig._seen_hashes.add(("AAPL", article_hash))
+
+        storage = _FakeStorage()
+        av = MagicMock()
+        av.fetch_news.return_value = [
+            _make_article(title="Shared macro", ticker="AAPL"),
+            _make_article(title="Shared macro", ticker="MSFT"),
+        ]
+        sig.run_pipeline(["AAPL", "MSFT"], av, storage)
+
+        # AAPL article is skipped (already in cache), MSFT is new → 1 news row
+        stored_tickers = [r["ticker"] for r in storage.news_rows]
+        assert "AAPL" not in stored_tickers
+        assert "MSFT" in stored_tickers
+
+        # MSFT signal must have been written (non-zero score because LLM returned direction=1)
+        msft_signals = [r for r in storage.signal_rows if r["ticker"] == "MSFT"]
+        assert len(msft_signals) == 1
 
     def test_duplicate_within_same_run(self, sig: Any) -> None:
         """If the same article appears twice in one fetch, second is deduplicated."""
