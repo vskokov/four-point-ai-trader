@@ -40,6 +40,22 @@ _DDL_OHLCV_INDEX = """
 CREATE INDEX IF NOT EXISTS ohlcv_ticker_time_idx ON ohlcv (ticker, time DESC);
 """
 
+# Remove duplicate (ticker, time) rows before creating the unique index.
+# Uses (tableoid, ctid) as a globally unique physical row identifier across
+# TimescaleDB chunks — plain ctid is chunk-local and unreliable for cross-chunk
+# NOT IN comparisons on hypertables.  This is a no-op when the table is clean.
+_DDL_OHLCV_DEDUP = """
+DELETE FROM ohlcv a
+WHERE EXISTS (
+    SELECT 1
+    FROM   ohlcv b
+    WHERE  b.ticker = a.ticker
+      AND  b.time   = a.time
+      AND  (b.tableoid < a.tableoid
+            OR (b.tableoid = a.tableoid AND b.ctid < a.ctid))
+);
+"""
+
 # Defense-in-depth: unique constraint on (ticker, time) prevents duplicate live
 # bars even if the insertion path is accidentally called twice.  TimescaleDB
 # supports UNIQUE constraints that include the partition column (time).
@@ -182,7 +198,6 @@ class Storage:
             conn.execute(text(_DDL_OHLCV))
             conn.execute(text(_DDL_OHLCV_HYPERTABLE))
             conn.execute(text(_DDL_OHLCV_INDEX))
-            conn.execute(text(_DDL_OHLCV_UNIQUE))
             conn.execute(text(_DDL_NEWS))
             conn.execute(text(_DDL_NEWS_MIGRATE_UNIQUE))
             conn.execute(text(_DDL_NEWS_UNIQUE_INDEX))
@@ -192,6 +207,13 @@ class Storage:
             conn.execute(text(_DDL_REGIME_LOG_HYPERTABLE))
             conn.execute(text(_DDL_TRADE_LOG))
             conn.execute(text(_DDL_TRADE_LOG_ADD_ANALYST))
+        # Dedup must be fully committed before CREATE UNIQUE INDEX scans the
+        # table — TimescaleDB chunk scans inside the index build do not see
+        # uncommitted deletes from the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(text(_DDL_OHLCV_DEDUP))
+        with self._engine.begin() as conn:
+            conn.execute(text(_DDL_OHLCV_UNIQUE))
         logger.info("storage.bootstrap", status="done")
 
     # ------------------------------------------------------------------
