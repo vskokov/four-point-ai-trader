@@ -31,20 +31,20 @@ routes orders — all driven by a local LLM (Ollama / Gemma) for news sentiment.
 
 ## Features
 
-| Layer | Capability |
-|---|---|
-| **Data** | TimescaleDB hypertables for OHLCV, signals, regimes, news, trade decisions; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking, earnings dates, and analyst recommendations with 24 h cache |
-| **Pair discovery** | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON |
-| **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars |
-| **Pairs trading** | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks |
-| **LLM sentiment** | Local Ollama (Gemma 4 e4b) scores news headlines into directional signals; retries on malformed JSON; 60-second timeout → safe neutral fallback |
-| **Meta-agent** | Multiplicative Weights Update (MWU) ensemble over 4 signals (HMM, OU, LLM, analyst recs) conditioned on HMM regime; analyst recs start at half weight (1/7 vs 2/7); per-regime weight isolation; online learning from realised price directions |
-| **Backtesting** | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results |
-| **Portfolio** | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys, cash re-fetched after sells) |
-| **Risk management** | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %) |
-| **Execution** | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes |
-| **Orchestration** | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation |
-| **Dashboard** | Standalone Streamlit app (`dashboard/app.py`); displays last 25/50/100 trades with HMM regime probabilities, OU spread details, LLM sentiment, analyst recommendation, MWU weights, and collapsible news headlines; auto-refreshes every 60 s |
+| Layer                | Capability                                                                                                                                                                                                                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Data**             | TimescaleDB hypertables for OHLCV, signals, regimes, news, trade decisions; Alpaca market data + WebSocket bars; Alpaca News (all tickers, single call per pipeline run); yfinance market-cap ranking, earnings dates, and analyst recommendations with 24 h cache                         |
+| **Pair discovery**   | Standalone scanner (`pair_scanner.py`) scans a ticker universe for cointegrated pairs; correlation pre-filter on log-returns, Engle-Granger + Johansen tests, OU half-life filter; results written to JSON                                                                                 |
+| **Regime detection** | 3-state Gaussian HMM (bear / neutral / bull) with deterministic post-hoc state labelling; online partial-fit every 20 bars                                                                                                                                                                 |
+| **Pairs trading**    | Kalman-filter adaptive hedge ratio; Ornstein-Uhlenbeck spread signal with z-score thresholds; periodic cointegration health checks                                                                                                                                                         |
+| **LLM sentiment**    | Local Ollama (Gemma 4 e4b) scores news headlines into directional signals; retries on malformed JSON; 60-second timeout → safe neutral fallback                                                                                                                                            |
+| **Meta-agent**       | Multiplicative Weights Update (MWU) ensemble over 4 signals (HMM, OU, LLM, analyst recs) conditioned on HMM regime; analyst recs start at half weight (1/7 vs 2/7); per-regime weight isolation; online learning from realised price directions                                            |
+| **Backtesting**      | Walk-forward vectorbt engine; Sharpe, CAGR, max-drawdown metrics; bias checks; CSV + PNG results                                                                                                                                                                                           |
+| **Portfolio**        | Daily Black-Litterman optimisation at 09:31 ET with MWU scores as views; LedoitWolf covariance; min-variance fallback; rebalance execution (sells before buys, cash re-fetched after sells)                                                                                                |
+| **Risk management**  | Fractional Kelly criterion (¼ Kelly default); per-position cap (10 % of equity); all buy sizing off **cash** (not equity or buying power) to enforce cash-only / no-margin trading; peak-drawdown circuit breaker (15 %); daily-loss circuit breaker (5 %)                                 |
+| **Execution**        | Alpaca `TradingClient`; market orders (DAY); sell capped at held quantity; emergency `close_all_positions`; market-open guard (Alpaca clock API, 60 s cache) blocks orders on weekends, holidays, and early closes                                                                         |
+| **Orchestration**    | APScheduler (4 cron jobs); SIGINT / SIGTERM graceful shutdown; atomic state persistence with SHA-256 checksum + 3-backup rotation                                                                                                                                                          |
+| **Dashboard**        | 4-tab Streamlit app (`dashboard/app.py`): **Overview** (equity curve + open positions + trade log), **Ticker Detail** (candlestick with regime bands, confirmed-fill markers, OU z-score + MWU score subplots), **Signals** (MWU weight evolution, signal win rates via LATERAL JOIN, signal agreement matrix), **News** (filterable headlines with LLM direction); auto-refreshes every 60 s |
 | **Decision quality** | Offline analysis framework (`analysis/`); joins `trade_log` + `ohlcv` for forward-return labels at 4 horizons; per-signal accuracy, MWU weight evolution, and parameter sensitivity sweeps for `hours_back`, `entry_z`, `min_confidence`, `eta`; Markdown report with auto-recommendations |
 
 ---
@@ -186,16 +186,16 @@ cp .env.example .env
 
 ### 2. Environment variables
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `ALPACA_API_KEY` | yes | — | Alpaca API key |
-| `ALPACA_SECRET_KEY` | yes | — | Alpaca secret key |
-| `ALPHAVANTAGE_API_KEY` | yes | — | Alpha Vantage API key (loaded at startup; AV not used for news in pipeline) |
-| `DB_URL` | yes | — | `postgresql+psycopg2://trader:traderpass@localhost:5432/trading` |
-| `ALPACA_BASE_URL` | no | `https://paper-api.alpaca.markets` | Use paper endpoint |
-| `OLLAMA_HOST` | no | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | no | `gemma4:e4b` | Ollama model tag |
-| `LOG_LEVEL` | no | `INFO` | `DEBUG` / `INFO` / `WARNING` |
+| Variable               | Required | Default                            | Description                                                                 |
+| ---------------------- | -------- | ---------------------------------- | --------------------------------------------------------------------------- |
+| `ALPACA_API_KEY`       | yes      | —                                  | Alpaca API key                                                              |
+| `ALPACA_SECRET_KEY`    | yes      | —                                  | Alpaca secret key                                                           |
+| `ALPHAVANTAGE_API_KEY` | yes      | —                                  | Alpha Vantage API key (loaded at startup; AV not used for news in pipeline) |
+| `DB_URL`               | yes      | —                                  | `postgresql+psycopg2://trader:traderpass@localhost:5432/trading`            |
+| `ALPACA_BASE_URL`      | no       | `https://paper-api.alpaca.markets` | Use paper endpoint                                                          |
+| `OLLAMA_HOST`          | no       | `http://localhost:11434`           | Ollama server URL                                                           |
+| `OLLAMA_MODEL`         | no       | `gemma4:e4b`                       | Ollama model tag                                                            |
+| `LOG_LEVEL`            | no       | `INFO`                             | `DEBUG` / `INFO` / `WARNING`                                                |
 
 ### 3. Start TimescaleDB
 
@@ -252,16 +252,16 @@ To automate the weekly rescan, add a cron entry (`crontab -e`):
 This fires every Monday at 08:00. Replace the ticker list with your universe.
 `discovered_pairs.json` is gitignored — each environment maintains its own.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--tickers` | required | Ticker universe to scan |
-| `--lookback-days` | 504 | Calendar days of history (~2 trading years) |
-| `--output` | `config/discovered_pairs.json` | Output file path |
-| `--min-correlation` | 0.70 | Minimum log-return Pearson correlation |
-| `--max-pvalue` | 0.05 | Maximum Engle-Granger p-value |
-| `--min-half-life` | 5 | Minimum OU half-life in bars (too fast = noise) |
-| `--max-half-life` | 60 | Maximum OU half-life in bars (too slow = no opportunity) |
-| `--max-pairs` | 10 | Maximum output pairs (ranked by EG p-value) |
+| Flag                | Default                        | Description                                              |
+| ------------------- | ------------------------------ | -------------------------------------------------------- |
+| `--tickers`         | required                       | Ticker universe to scan                                  |
+| `--lookback-days`   | 504                            | Calendar days of history (~2 trading years)              |
+| `--output`          | `config/discovered_pairs.json` | Output file path                                         |
+| `--min-correlation` | 0.70                           | Minimum log-return Pearson correlation                   |
+| `--max-pvalue`      | 0.05                           | Maximum Engle-Granger p-value                            |
+| `--min-half-life`   | 5                              | Minimum OU half-life in bars (too fast = noise)          |
+| `--max-half-life`   | 60                             | Maximum OU half-life in bars (too slow = no opportunity) |
+| `--max-pairs`       | 10                             | Maximum output pairs (ranked by EG p-value)              |
 
 ### Step 2 — Run the engine
 
@@ -293,13 +293,16 @@ usage: four-point-trader [--tickers TICKER [TICKER ...]]
                          [--live]
                          [--log-level {DEBUG,INFO,WARNING,ERROR}]
                          [--log-file PATH]
+                         [--update-kelly-stats]
 
 options:
-  --tickers     Equity symbols to trade (default: AAPL MSFT JPM BAC)
-  --pairs-file  Path to discovered_pairs.json (default: config/discovered_pairs.json)
-  --live        Connect to Alpaca live trading  [paper is default]
-  --log-level   Logging verbosity (default: INFO)
-  --log-file    Optional path for newline-delimited JSON log file
+  --tickers            Equity symbols to trade (default: AAPL MSFT JPM BAC)
+  --pairs-file         Path to discovered_pairs.json (default: config/discovered_pairs.json)
+  --live               Connect to Alpaca live trading  [paper is default]
+  --log-level          Logging verbosity (default: INFO)
+  --log-file           Optional path for newline-delimited JSON log file
+  --update-kelly-stats Recompute Kelly sizing stats from Alpaca confirmed fill P&L,
+                       write updated engine_state.json, and exit (no trading)
 ```
 
 Shutdown cleanly with `Ctrl-C` or `SIGTERM`. If the circuit breaker fires, all
@@ -327,29 +330,34 @@ Each script prints `✓ / ✗ / ⚠` per check and exits 0 on success.
 
 ### Step 5 — Run the dashboard (optional)
 
-In a separate terminal, start the Streamlit decision-audit dashboard:
+In a separate terminal, start the Streamlit monitoring dashboard:
 
 ```bash
 cd trading_engine
 .venv/bin/streamlit run dashboard/app.py
 ```
 
-Open `http://localhost:8501`. Shows the last 25/50/100 trades with full
-signal breakdown and contributing news headlines. Auto-refreshes every 60 s.
+Open `http://localhost:8501`. Four tabs:
+- **Overview** — equity curve with confirmed-fill markers, open positions table, collapsible trade log
+- **Ticker Detail** — candlestick + regime background bands + OU z-score + MWU score subplots, ticker selector, period picker
+- **Signals** — MWU weight evolution, per-signal win rates (1m/15m/1h horizons), signal agreement matrix
+- **News** — filterable headlines table with LLM direction and sentiment scores
+
+Auto-refreshes every 60 s.
 
 ---
 
 ## Risk controls
 
-| Control | Default | Description |
-|---|---|---|
-| Cash-only sizing | — | All buy orders sized off `account.cash`, never `equity` or `buying_power`; no margin used |
-| Max position per ticker | 10 % of equity | Position limit % measured against equity; dollar cap further constrained to available cash |
-| Peak drawdown halt | 15 % | Triggers circuit breaker, liquidates all positions |
-| Daily loss halt | 5 % | Triggers circuit breaker, liquidates all positions |
-| Kelly fraction | ¼ Kelly | `RiskManager.kelly_fraction` |
-| Order type | Market / DAY | No limit orders; sells capped at held quantity; sells are not cash-constrained |
-| Rebalance cash gate | — | Cash re-fetched after sells; each buy deducts from `available_cash`; insufficient cash → buy skipped |
+| Control                 | Default        | Description                                                                                          |
+| ----------------------- | -------------- | ---------------------------------------------------------------------------------------------------- |
+| Cash-only sizing        | —              | All buy orders sized off `account.cash`, never `equity` or `buying_power`; no margin used            |
+| Max position per ticker | 10 % of equity | Position limit % measured against equity; dollar cap further constrained to available cash           |
+| Peak drawdown halt      | 15 %           | Triggers circuit breaker, liquidates all positions                                                   |
+| Daily loss halt         | 5 %            | Triggers circuit breaker, liquidates all positions                                                   |
+| Kelly fraction          | ¼ Kelly        | `RiskManager.kelly_fraction`                                                                         |
+| Order type              | Market / DAY   | No limit orders; sells capped at held quantity; sells are not cash-constrained                       |
+| Rebalance cash gate     | —              | Cash re-fetched after sells; each buy deducts from `available_cash`; insufficient cash → buy skipped |
 
 The circuit breaker fires **before** any order on every bar and before every
 portfolio rebalance. If triggered it sets an emergency flag, signals the
@@ -383,23 +391,23 @@ TEST_DB_URL="postgresql+psycopg2://trader:traderpass@localhost:5432/trading" \
     .venv/bin/pytest tests/test_storage.py -v
 ```
 
-| Test file | Tests | Scope |
-|---|---|---|
-| `test_alpaca_client.py` | 25 | Alpaca data + news clients; `is_market_open` cache |
-| `test_alphavantage_client.py` | 30 | Alpha Vantage news + rate limiting |
-| `test_hmm_regime.py` | 28 | HMM fit, predict, online update, persistence |
-| `test_mean_reversion.py` | 36 | Cointegration, OU params, Kalman hedge ratio |
-| `test_llm_sentiment.py` | 56 | LLM prompt, parse, retry, pipeline (Alpaca-only mode) |
-| `test_backtest_engine.py` | 27 | BacktestEngine, walk-forward, bias checks |
-| `test_mwu_agent.py` | 53 | MWU weights (4-signal, half-weight init), decide, update, scheduled_update |
-| `test_executor.py` | 47 | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard |
-| `test_engine.py` | 105 | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard; analyst signal logged to trade_log |
-| `test_portfolio_optimizer.py` | 9 | Black-Litterman, min-variance, rebalance orders |
-| `test_pair_scanner.py` | 21 | Pair scanner pipeline, filter stages, JSON output |
-| `test_fundamentals_client.py` | 32 | FundamentalsClient market cap, earnings dates, analyst recommendations — all with 24 h cache |
-| `tests/analysis/` | 68 | Offline analysis framework — outcome labels, per-signal accuracy, weight evolution, parameter sweeps; no DB required |
-| `test_storage.py` | — | Integration (requires `TEST_DB_URL`) |
-| **Total (unit)** | **542** | |
+| Test file                     | Tests   | Scope                                                                                                                                                                                       |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_alpaca_client.py`       | 25      | Alpaca data + news clients; `is_market_open` cache                                                                                                                                          |
+| `test_alphavantage_client.py` | 30      | Alpha Vantage news + rate limiting                                                                                                                                                          |
+| `test_hmm_regime.py`          | 28      | HMM fit, predict, online update, persistence                                                                                                                                                |
+| `test_mean_reversion.py`      | 36      | Cointegration, OU params, Kalman hedge ratio                                                                                                                                                |
+| `test_llm_sentiment.py`       | 56      | LLM prompt, parse, retry, pipeline (Alpaca-only mode)                                                                                                                                       |
+| `test_backtest_engine.py`     | 27      | BacktestEngine, walk-forward, bias checks                                                                                                                                                   |
+| `test_mwu_agent.py`           | 53      | MWU weights (4-signal, half-weight init), decide, update, scheduled_update                                                                                                                  |
+| `test_executor.py`            | 47      | RiskManager, Kelly sizing, OrderExecutor; cash-only enforcement; market-closed guard                                                                                                        |
+| `test_engine.py`              | 106     | TradingEngine bar_handler, jobs, shutdown, StateManager, pairs loading; rebalance cash gate; HMM seeding; Alpaca-only sentiment routing; earnings guard; analyst signal logged to trade_log; Kelly stats from fills |
+| `test_portfolio_optimizer.py` | 9       | Black-Litterman, min-variance, rebalance orders                                                                                                                                             |
+| `test_pair_scanner.py`        | 21      | Pair scanner pipeline, filter stages, JSON output                                                                                                                                           |
+| `test_fundamentals_client.py` | 32      | FundamentalsClient market cap, earnings dates, analyst recommendations — all with 24 h cache                                                                                                |
+| `tests/analysis/`             | 68      | Offline analysis framework — outcome labels, per-signal accuracy, weight evolution, parameter sweeps; no DB required                                                                        |
+| `test_storage.py`             | —       | Integration (requires `TEST_DB_URL`)                                                                                                                                                        |
+| **Total (unit)**              | **543** |                                                                                                                                                                                             |
 
 ---
 
@@ -412,6 +420,16 @@ EOD job and on clean shutdown:
   fitted flags
 - SHA-256 checksum embedded — load raises `ValueError` on corruption
 - Rolling 3-backup rotation (`engine_state.json.bak1` … `.bak3`)
+
+**Kelly stats** (`win_rate`, `avg_win`, `avg_loss` per ticker) are recomputed
+at EOD from Alpaca confirmed fill P&L using FIFO round-trip pairing (90-day
+lookback, minimum 5 round-trips per ticker before deviating from conservative
+defaults of 52% win rate). On startup, any `win_rate < 0.30` loaded from state
+is automatically reset to defaults. To manually refresh after a stale state file:
+
+```bash
+.venv/bin/python -m trading_engine.main --tickers ... --update-kelly-stats
+```
 
 HMM models, Kalman filters, and MWU weights are persisted by their own modules
 (`models/hmm_{ticker}.pkl`, `models/kalman_{t1}_{t2}.pkl`,
@@ -429,12 +447,12 @@ rm trading_engine/models/engine_state.json*
 
 ## Scheduled jobs
 
-| Job | Trigger | Action |
-|---|---|---|
+| Job                   | Trigger                              | Action                                                                                |
+| --------------------- | ------------------------------------ | ------------------------------------------------------------------------------------- |
 | `sentiment_job_early` | Every 25 min, 07:00–10:29 ET Mon–Fri | All tickers via Alpaca News (single fetch call) → Gemma scoring → `signal_log` insert |
-| `sentiment_job_late` | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (lower cadence for later session) |
-| `market_open_job` | 09:31 ET Mon–Fri | Black-Litterman portfolio optimisation → rebalance execution (cash-gated buys) |
-| `eod_job` | 16:05 ET Mon–Fri | P&L log, MWU performance report, Kelly stat refresh, state save |
+| `sentiment_job_late`  | Every 35 min, 10:30–16:30 ET Mon–Fri | Same as above (lower cadence for later session)                                       |
+| `market_open_job`     | 09:31 ET Mon–Fri                     | Black-Litterman portfolio optimisation → rebalance execution (cash-gated buys)        |
+| `eod_job`             | 16:05 ET Mon–Fri                     | P&L log, MWU performance report, Kelly stat refresh, state save                       |
 
 No Alpha Vantage calls are made during sentiment jobs. AV's free tier was abandoned
 because it rejects multi-ticker NEWS_SENTIMENT queries with `"Invalid inputs"` and its
@@ -445,53 +463,23 @@ because it rejects multi-ticker NEWS_SENTIMENT queries with `"Invalid inputs"` a
 
 ## Development phases
 
-| Phase | Scope | Status |
-|---|---|---|
-| 1 — Data layer | TimescaleDB, Alpaca client, Alpha Vantage client | Complete |
-| 2 — Signals | HMM regime, Kalman pairs / OU mean-reversion, LLM sentiment | Complete |
-| 3 — Backtesting | BacktestEngine (vectorbt), walk-forward, bias checks | Complete |
-| 4 — Meta-agent | MWU ensemble conditioned on HMM regime | Complete |
-| 5 — Execution | Fractional Kelly sizing, risk controls, order routing, orchestration | Complete |
-| 6 — Portfolio | Black-Litterman + Min-Variance optimisation, daily rebalance | Complete |
-| 7 — Pair discovery | Standalone cointegration scanner, JSON-driven pair loading | Complete |
-| 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe | Complete |
-| 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate | Complete |
-| 10 — Observability | Trade decision dashboard (Streamlit); colored regime banner in logs; `trade_log` DB table; contributing headlines persisted; per-ticker MWU weight files; HMM history seeding at startup | Complete |
-| 11 — News routing | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts | Complete |
-| 12 — Analyst signal | `FundamentalsClient.get_analyst_recommendations` (24 h cache); 4th MWU signal at half initial weight (1/7); `analyst_signal` + `analyst_confidence` columns in `trade_log`; auto-migration on bootstrap | Complete |
+| Phase                 | Scope                                                                                                                                                                                                                                                                   | Status   |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| 1 — Data layer        | TimescaleDB, Alpaca client, Alpha Vantage client                                                                                                                                                                                                                        | Complete |
+| 2 — Signals           | HMM regime, Kalman pairs / OU mean-reversion, LLM sentiment                                                                                                                                                                                                             | Complete |
+| 3 — Backtesting       | BacktestEngine (vectorbt), walk-forward, bias checks                                                                                                                                                                                                                    | Complete |
+| 4 — Meta-agent        | MWU ensemble conditioned on HMM regime                                                                                                                                                                                                                                  | Complete |
+| 5 — Execution         | Fractional Kelly sizing, risk controls, order routing, orchestration                                                                                                                                                                                                    | Complete |
+| 6 — Portfolio         | Black-Litterman + Min-Variance optimisation, daily rebalance                                                                                                                                                                                                            | Complete |
+| 7 — Pair discovery    | Standalone cointegration scanner, JSON-driven pair loading                                                                                                                                                                                                              | Complete |
+| 8 — Market-open guard | Alpaca clock API guard on all order paths; holiday / early-close safe                                                                                                                                                                                                   | Complete |
+| 9 — Cash-only trading | Buy sizing off `cash` not `equity`; hard cash cap; rebalance cash gate                                                                                                                                                                                                  | Complete |
+| 10 — Observability    | Trade decision dashboard (Streamlit); colored regime banner in logs; `trade_log` DB table; contributing headlines persisted; per-ticker MWU weight files; HMM history seeding at startup                                                                                | Complete |
+| 11 — News routing     | `FundamentalsClient` (yfinance, 24 h cap cache); all tickers → Alpaca News (AV abandoned — free tier rejects multi-ticker queries); connectivity check scripts                                                                                                          | Complete |
+| 12 — Analyst signal   | `FundamentalsClient.get_analyst_recommendations` (24 h cache); 4th MWU signal at half initial weight (1/7); `analyst_signal` + `analyst_confidence` columns in `trade_log`; auto-migration on bootstrap                                                                 | Complete |
 | 13 — Decision quality | Offline analysis framework (`analysis/`); forward-return outcome labeling at 1 m / 15 m / 1 h / 4 h; per-signal accuracy and IC; MWU weight evolution; parameter sweeps for `hours_back`, `entry_z`, `min_confidence`, `eta`; Markdown report with auto-recommendations | Complete |
-
----
-
-## Decision quality analysis
-
-After the engine has been running for 2+ weeks, use the offline analysis framework
-to assess signal quality and generate parameter recommendations:
-
-```bash
-cd trading_engine
-.venv/bin/python -m analysis.run_analysis \
-    --db-url "$DB_URL" \
-    --days 14 \
-    --output-dir analysis/reports/
-```
-
-The report covers:
-
-| Analysis | What it tells you |
-|---|---|
-| Ensemble accuracy | Win rate at 1 m / 15 m / 1 h / 4 h horizons, by regime and score band |
-| Per-signal accuracy | HMM, OU, LLM, and analyst recs win rates and information coefficients independently |
-| MWU weight evolution | Which signals the engine promoted vs demoted over time |
-| `hours_back` sweep | Does headline freshness correlate with LLM accuracy? |
-| `entry_z` sweep | OU accuracy vs trade frequency at z = 1.5 / 2.0 / 2.5 / 3.0 |
-| `min_confidence` sweep | Optimal score threshold (fewer but better trades) |
-| `eta` sweep | MWU learning-rate sensitivity via update replay |
-| Recommendations | Specific parameter change suggestions with supporting evidence |
-
-All analysis reads the live DB; no engine restart or code change required.
-Recommended cadence: first run after 2 weeks (tune `min_confidence`, `hours_back`);
-full review after 6 weeks (add `entry_z`, `eta`).
+| 14 — Dashboard redesign | 4-tab Streamlit app; candlestick with regime bands + confirmed-fill markers; OU z-score + MWU score subplots; MWU weight evolution; signal win rates via LATERAL JOIN; signal agreement matrix; news tab | Complete |
+| 15 — Kelly stats fix | Kelly sizing stats computed from Alpaca confirmed fill P&L (FIFO round-trip pairing, 90-day window, min 5 trips); decoupled from MWU win rates; startup sanity reset for stale state; `--update-kelly-stats` CLI flag | Complete |
 
 ---
 
