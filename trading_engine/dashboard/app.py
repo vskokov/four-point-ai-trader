@@ -767,42 +767,42 @@ def _render_trade(row: pd.Series, orders_df: pd.DataFrame) -> None:
             _render_regime_probs(_parse_json(row.get("regime_probs")))
             hmm_sig, hmm_conf = row.get("hmm_signal"), row.get("hmm_confidence")
             st.caption(
-                f"Signal: **{hmm_sig}** | Conf: **{float(hmm_conf):.2f}**"
-                if hmm_sig is not None and hmm_conf is not None else "No HMM data"
+                f"Signal: **{int(hmm_sig)}** | Conf: **{float(hmm_conf):.2f}**"
+                if pd.notna(hmm_sig) and pd.notna(hmm_conf) else "No HMM data"
             )
         with col_ou:
             st.markdown("#### OU Spread")
             pair = row.get("ou_pair")
-            if pair:
+            if pair and pd.notna(pair):
                 st.markdown(f"**Pair:** `{pair}`")
                 ou_z = row.get("ou_zscore")
                 ou_s = row.get("ou_spread_value")
                 ou_sig, ou_conf = row.get("ou_signal"), row.get("ou_confidence")
-                st.metric("Z-score", f"{float(ou_z):.3f}" if ou_z is not None else "—")
-                st.metric("Spread",  f"{float(ou_s):.5f}" if ou_s is not None else "—")
+                st.metric("Z-score", f"{float(ou_z):.3f}" if pd.notna(ou_z) else "—")
+                st.metric("Spread",  f"{float(ou_s):.5f}" if pd.notna(ou_s) else "—")
                 st.caption(
-                    f"Signal: **{ou_sig}** | Conf: **{float(ou_conf):.2f}**"
-                    if ou_sig is not None and ou_conf is not None else ""
+                    f"Signal: **{int(ou_sig)}** | Conf: **{float(ou_conf):.2f}**"
+                    if pd.notna(ou_sig) and pd.notna(ou_conf) else ""
                 )
             else:
                 st.caption("No active pair for this ticker.")
         with col_llm:
             st.markdown("#### LLM Sentiment")
             llm_sig, llm_conf = row.get("llm_signal"), row.get("llm_confidence")
-            llm_lbl = _SIGNAL_LABEL.get(int(llm_sig), "NEUTRAL") if llm_sig is not None else "—"
+            llm_lbl = _SIGNAL_LABEL.get(int(llm_sig), "NEUTRAL") if pd.notna(llm_sig) else "—"
             st.markdown(f"Direction: **{llm_lbl}**")
             st.caption(
-                f"Signal: **{llm_sig}** | Conf: **{float(llm_conf):.2f}**"
-                if llm_sig is not None and llm_conf is not None else "No LLM data"
+                f"Signal: **{int(llm_sig)}** | Conf: **{float(llm_conf):.2f}**"
+                if pd.notna(llm_sig) and pd.notna(llm_conf) else "No LLM data"
             )
         with col_analyst:
             st.markdown("#### Analyst Recs")
             a_sig, a_conf = row.get("analyst_signal"), row.get("analyst_confidence")
-            a_lbl = _SIGNAL_LABEL.get(int(a_sig), "NEUTRAL") if a_sig is not None else "—"
+            a_lbl = _SIGNAL_LABEL.get(int(a_sig), "NEUTRAL") if pd.notna(a_sig) else "—"
             st.markdown(f"Direction: **{a_lbl}**")
             st.caption(
-                f"Signal: **{a_sig}** | Conf: **{float(a_conf):.2f}**"
-                if a_sig is not None and a_conf is not None else "No analyst data"
+                f"Signal: **{int(a_sig)}** | Conf: **{float(a_conf):.2f}**"
+                if pd.notna(a_sig) and pd.notna(a_conf) else "No analyst data"
             )
 
         st.divider()
