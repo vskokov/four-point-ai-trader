@@ -149,6 +149,10 @@ _DEFAULT_SIGNAL_STATS: dict[str, float] = {
     "avg_loss": 0.010,
 }
 
+# Kelly stats computed from Alpaca fill P&L
+_KELLY_LOOKBACK_DAYS  = 90   # days of fill history to consider
+_KELLY_MIN_ROUNDTRIPS = 5    # minimum completed BUY→SELL pairs before trusting stats
+
 
 class TradingEngine:
     """
@@ -301,6 +305,18 @@ class TradingEngine:
             return
 
         self._signal_stats.update(state.get("signal_stats", {}))
+
+        # Sanity-reset any poisoned win_rate values (e.g. from MWU mis-wiring)
+        for ticker, stats in self._signal_stats.items():
+            if stats.get("win_rate", 0.0) < 0.30:
+                logger.warning(
+                    "engine.state_restore.kelly_reset",
+                    ticker=ticker,
+                    poisoned_win_rate=stats.get("win_rate"),
+                    hint="win_rate < 0.30 is implausibly low; reverting to defaults",
+                )
+                self._signal_stats[ticker] = dict(_DEFAULT_SIGNAL_STATS)
+
         logger.info("engine.state_restored", keys=list(state.keys()))
 
     def _save_state(self) -> None:
@@ -314,6 +330,116 @@ class TradingEngine:
                 "hmm_fitted":   {t: self._hmm[t].is_fitted for t in self._tickers},
             }
         )
+
+    def _compute_kelly_stats_from_fills(self) -> dict[str, dict[str, float]]:
+        """
+        Compute Kelly sizing stats from Alpaca confirmed fill P&L.
+
+        Fetches all CLOSED orders from the last _KELLY_LOOKBACK_DAYS days, pairs
+        BUY and SELL fills per ticker using FIFO, and computes win_rate, avg_win,
+        avg_loss from the resulting round-trips.
+
+        Returns
+        -------
+        dict
+            ``{ticker: {"win_rate": float, "avg_win": float, "avg_loss": float}}``
+            for tickers with at least _KELLY_MIN_ROUNDTRIPS completed round-trips.
+            Tickers below the threshold are omitted; the caller should fall back
+            to ``_DEFAULT_SIGNAL_STATS``.
+        """
+        from datetime import timedelta
+        from alpaca.trading.enums import OrderSide, QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_KELLY_LOOKBACK_DAYS)
+        try:
+            orders = self._executor._trading.get_orders(
+                GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    after=cutoff,
+                    limit=500,
+                )
+            )
+        except Exception as exc:
+            logger.warning("engine.kelly_stats.fetch_failed", error=str(exc))
+            return {}
+
+        # Collect filled orders per ticker
+        fills: dict[str, list[dict[str, Any]]] = {}
+        for o in orders:
+            if o.filled_qty is None or float(o.filled_qty) == 0:
+                continue
+            if o.filled_avg_price is None:
+                continue
+            fills.setdefault(o.symbol, []).append(
+                {
+                    "side":  o.side,
+                    "qty":   float(o.filled_qty),
+                    "price": float(o.filled_avg_price),
+                    "time":  o.filled_at,
+                }
+            )
+
+        result: dict[str, dict[str, float]] = {}
+        for ticker, ticker_fills in fills.items():
+            if ticker not in self._tickers:
+                continue
+
+            ticker_fills.sort(key=lambda x: x["time"])
+
+            # FIFO pairing: each SELL consumes the oldest unmatched BUY
+            buy_queue: list[dict[str, Any]] = []
+            wins:   list[float] = []
+            losses: list[float] = []
+
+            for fill in ticker_fills:
+                if fill["side"] == OrderSide.BUY:
+                    buy_queue.append(fill)
+                elif fill["side"] == OrderSide.SELL and buy_queue:
+                    buy = buy_queue.pop(0)
+                    pct = (fill["price"] - buy["price"]) / buy["price"]
+                    if pct > 0:
+                        wins.append(pct)
+                    else:
+                        losses.append(abs(pct))
+
+            n = len(wins) + len(losses)
+            if n < _KELLY_MIN_ROUNDTRIPS:
+                continue  # not enough data; caller uses defaults
+
+            win_rate = len(wins) / n
+            avg_win  = float(sum(wins)   / len(wins))   if wins   else 0.005
+            avg_loss = float(sum(losses) / len(losses)) if losses else 0.005
+
+            result[ticker] = {
+                "win_rate": win_rate,
+                "avg_win":  max(avg_win,  0.001),
+                "avg_loss": max(avg_loss, 0.001),
+            }
+
+        return result
+
+    def _update_kelly_stats(self) -> None:
+        """
+        Recompute Kelly stats from Alpaca fill P&L and update ``_signal_stats``
+        in-place.  Tickers with insufficient round-trips keep their current stats
+        (or ``_DEFAULT_SIGNAL_STATS`` if never updated).
+        """
+        computed = self._compute_kelly_stats_from_fills()
+        for ticker in self._tickers:
+            if ticker in computed:
+                self._signal_stats[ticker] = computed[ticker]
+                logger.info(
+                    "engine.kelly_stats.updated",
+                    ticker=ticker,
+                    **computed[ticker],
+                )
+            else:
+                logger.debug(
+                    "engine.kelly_stats.insufficient_data",
+                    ticker=ticker,
+                    hint=f"need {_KELLY_MIN_ROUNDTRIPS} round-trips, keeping current stats",
+                )
 
     def _load_models(self) -> None:
         """Attempt to load persisted HMM models for each ticker."""
@@ -1163,17 +1289,16 @@ class TradingEngine:
                     weights=report.get("current_weights"),
                 )
 
-                # Derive ensemble win rate from per-signal rates
-                rates = [
-                    v for v in report.get("per_signal_win_rate", {}).values()
-                    if v is not None
-                ]
-                if rates:
-                    self._signal_stats[ticker]["win_rate"] = sum(rates) / len(rates)
             except Exception as exc:
                 logger.error(
                     "engine.eod_job.mwu_report_failed", ticker=ticker, error=str(exc)
                 )
+
+        # Update Kelly stats from confirmed Alpaca fill P&L
+        try:
+            self._update_kelly_stats()
+        except Exception as exc:
+            logger.error("engine.eod_job.kelly_stats_failed", error=str(exc))
 
         # Persist state
         try:

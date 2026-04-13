@@ -775,11 +775,19 @@ class TestEODJob:
         for t in ("AAPL", "MSFT"):
             mwu_map[t].performance_report.assert_called_once()
 
-    def test_win_rate_updated_in_signal_stats(self, tmp_path):
-        engine, _, _, mwu_map = _build_engine(tmp_path=tmp_path)
-        # Signals: hmm=0.60, ou=0.55, llm=0.58, analyst=0.52 → avg = 0.5625
+    def test_kelly_stats_updated_from_fills(self, tmp_path):
+        """eod_job must call _update_kelly_stats (not derive from MWU win rates)."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        with patch.object(engine, "_update_kelly_stats") as mock_update:
+            engine.eod_job()
+        mock_update.assert_called_once()
+
+    def test_win_rate_stays_at_default_when_no_fills(self, tmp_path):
+        """With no Alpaca fills, Kelly stats remain at _DEFAULT_SIGNAL_STATS."""
+        engine, _, _, _ = _build_engine(tmp_path=tmp_path)
+        engine._executor._trading.get_orders.return_value = []
         engine.eod_job()
-        assert engine._signal_stats["AAPL"]["win_rate"] == pytest.approx(0.5625, abs=0.01)
+        assert engine._signal_stats["AAPL"]["win_rate"] == pytest.approx(0.52, abs=0.001)
 
     def test_state_saved(self, tmp_path):
         engine, _, _, _ = _build_engine(tmp_path=tmp_path)

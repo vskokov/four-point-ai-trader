@@ -71,6 +71,14 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Optional path for newline-delimited JSON log file.",
     )
+    p.add_argument(
+        "--update-kelly-stats",
+        action="store_true",
+        help=(
+            "Recompute Kelly sizing stats from Alpaca confirmed fill P&L, "
+            "write updated engine_state.json, and exit."
+        ),
+    )
     return p
 
 
@@ -116,6 +124,12 @@ def main(argv: list[str] | None = None) -> None:
     except RuntimeError as exc:
         logger.error("main.startup_failed", error=str(exc))
         sys.exit(1)
+
+    if args.update_kelly_stats:
+        engine._update_kelly_stats()
+        engine._save_state()
+        logger.info("main.kelly_stats_updated")
+        return
 
     engine.run()
     logger.info("main.exit")
