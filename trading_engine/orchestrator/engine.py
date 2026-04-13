@@ -481,7 +481,8 @@ class TradingEngine:
             return {"signal": 0, "confidence": 0.0, "contributing_headlines": []}
 
         value = float(row[0])
-        meta: dict[str, Any] = json.loads(row[1]) if row[1] else {}
+        _raw = row[1]
+        meta: dict[str, Any] = _raw if isinstance(_raw, dict) else (json.loads(_raw) if _raw else {})
         direction = int(meta.get("direction", 0))
         confidence = float(meta.get("confidence", abs(value)))
         headlines: list[dict[str, Any]] = meta.get("contributing_headlines", [])
