@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 
 _CACHE_TTL_SECONDS = 86_400   # 24 hours
 _FETCH_WORKERS = 10           # parallel yfinance requests
+_VIX_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 class FundamentalsClient:
@@ -298,6 +299,32 @@ class FundamentalsClient:
                 self._recs_cache[t] = {"value": signal, "fetched_at": now}
 
         return result
+
+    # ------------------------------------------------------------------
+    # VIX
+    # ------------------------------------------------------------------
+
+    def get_vix(self) -> float | None:
+        """
+        Fetch the current VIX level from yfinance.  Returns ``None`` on failure
+        (fail open — a data outage must not block order submission).
+
+        Results are cached for 5 minutes (``_VIX_CACHE_TTL_SECONDS``).
+        The cache is stored as ``self._vix_cache`` and initialised lazily on the
+        first call so no ``__init__`` change is needed.
+        """
+        now = datetime.now(timezone.utc)
+        cached = getattr(self, "_vix_cache", None)
+        if cached and (now - cached["fetched_at"]).total_seconds() < _VIX_CACHE_TTL_SECONDS:
+            return cached["value"]
+        try:
+            vix = yf.Ticker("^VIX").fast_info["last_price"]
+            value: float | None = float(vix) if vix is not None else None
+        except Exception as exc:
+            logger.warning("fundamentals_client.vix.error", exc=str(exc)[:120])
+            value = None
+        self._vix_cache: dict[str, Any] = {"value": value, "fetched_at": now}
+        return value
 
     def _fetch_analyst_recs_parallel(
         self, tickers: list[str]

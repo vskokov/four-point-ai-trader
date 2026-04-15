@@ -380,6 +380,77 @@ class Storage:
         )
         return df
 
+    def query_news_fallback(
+        self,
+        ticker: str,
+        hours_back: float = 12.0,
+        limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieve the most recent *limit* news articles for *ticker* within the
+        last *hours_back* hours, returned as a list of dicts compatible with
+        ``AlpacaNewsClient.fetch_news`` output.
+
+        Used by ``LLMSentimentSignal.run_pipeline`` as a local cache fallback
+        when a ticker has no fresh live articles.  Each returned dict includes:
+
+        * ``headline_hash``, ``title``, ``summary``, ``source``, ``fetched_at``
+        * ``tickers``       — ``[ticker]`` for downstream grouping
+        * ``ticker``        — the requested ticker symbol
+        * ``relevance_score`` — 0.5 (above the ``min_relevance=0.3`` filter)
+        * ``published_at``  — alias of ``fetched_at`` for prompt age display
+
+        Parameters
+        ----------
+        ticker:
+            Equity symbol to look up.
+        hours_back:
+            How far back to look, in hours.  Defaults to 12.
+        limit:
+            Maximum number of articles to return.  Defaults to 2.
+
+        Returns
+        -------
+        list[dict]
+            Empty list when no articles are found.
+        """
+        stmt = text(
+            """
+            SELECT headline_hash, title, summary, source, fetched_at
+            FROM   news
+            WHERE  ticker     = :ticker
+              AND  fetched_at >= NOW() - (:hours_back * INTERVAL '1 hour')
+            ORDER  BY fetched_at DESC
+            LIMIT  :limit
+            """
+        )
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                stmt,
+                {"ticker": ticker, "hours_back": hours_back, "limit": limit},
+            )
+            rows = result.fetchall()
+            keys = result.keys()
+
+        articles: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(zip(keys, row))
+            d["ticker"] = ticker
+            d["tickers"] = [ticker]
+            d["relevance_score"] = 0.5
+            d["published_at"] = d["fetched_at"]
+            d.setdefault("av_sentiment_label", "")
+            d.setdefault("av_sentiment_score", None)
+            articles.append(d)
+
+        logger.info(
+            "storage.query_news_fallback",
+            ticker=ticker,
+            hours_back=hours_back,
+            rows=len(articles),
+        )
+        return articles
+
     # ------------------------------------------------------------------
     # Signal log
     # ------------------------------------------------------------------

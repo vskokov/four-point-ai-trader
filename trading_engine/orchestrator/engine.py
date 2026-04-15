@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -67,6 +67,28 @@ def _to_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _vix_risk_off_multiplier(vix: float | None) -> float:
+    """
+    Return a position-sizing multiplier based on the current VIX level.
+
+    Returns 1.0 (no reduction) when VIX is unknown.
+
+    VIX > 40 → 0.25 (extreme fear — cut to 25 %)
+    VIX > 30 → 0.50 (high fear  — cut to 50 %)
+    VIX > 25 → 0.75 (elevated   — cut to 75 %)
+    VIX ≤ 25 → 1.00 (normal     — no adjustment)
+    """
+    if vix is None:
+        return 1.0
+    if vix > 40:
+        return 0.25
+    if vix > 30:
+        return 0.50
+    if vix > 25:
+        return 0.75
+    return 1.0
 
 
 # Default path for discovered pairs written by pair_scanner.py
@@ -182,6 +204,9 @@ class TradingEngine:
         pairs_file: Path | str | None = None,
     ) -> None:
         self._tickers = list(tickers)
+        if "SPY" not in self._tickers:
+            logger.info("engine.spy_added", reason="always_present_for_benchmark")
+            self._tickers.append("SPY")
         self._pairs = _load_discovered_pairs(
             Path(pairs_file) if pairs_file is not None else None
         )
@@ -286,6 +311,13 @@ class TradingEngine:
         self._last_signal_change_time: dict[str, datetime | None] = {
             t: None for t in self._tickers
         }
+
+        # PDT cooldown: tickers that hit Alpaca error 40310100 today; reset at UTC midnight.
+        self._pdt_blocked_today: set[str] = set()
+        self._pdt_blocked_date: date | None = None
+
+        # VIX risk-off multiplier: refreshed by market_open_job; 1.0 = no reduction.
+        self._vix_multiplier: float = 1.0
 
         # Load any persisted metadata
         self._load_state()
@@ -906,19 +938,43 @@ class TradingEngine:
                     "engine.bar_handler.order_skipped_market_closed", ticker=ticker
                 )
             else:
-                try:
-                    account_info = self._alpaca.get_account_info()
-                    self._executor.submit_order(
+                # Reset PDT cooldown set at UTC midnight.
+                _today = datetime.now(timezone.utc).date()
+                if self._pdt_blocked_date != _today:
+                    self._pdt_blocked_today = set()
+                    self._pdt_blocked_date = _today
+
+                if final_signal == -1 and ticker in self._pdt_blocked_today:
+                    logger.warning(
+                        "engine.bar_handler.pdt_skip",
                         ticker=ticker,
-                        signal=final_signal,
-                        confidence=abs(decision["score"]),
-                        account_info=account_info,
-                        signal_stats=self._signal_stats[ticker],
+                        reason="pdt_blocked_today",
                     )
-                except Exception as exc:
-                    logger.error(
-                        "engine.order_failed", ticker=ticker, error=str(exc)
-                    )
+                else:
+                    try:
+                        account_info = self._alpaca.get_account_info()
+                        self._executor.submit_order(
+                            ticker=ticker,
+                            signal=final_signal,
+                            confidence=abs(decision["score"]),
+                            account_info=account_info,
+                            signal_stats=self._signal_stats[ticker],
+                            regime=regime_label,
+                            vix_multiplier=self._vix_multiplier,
+                        )
+                    except Exception as exc:
+                        exc_str = str(exc)
+                        if "40310100" in exc_str:
+                            self._pdt_blocked_today.add(ticker)
+                            logger.warning(
+                                "engine.bar_handler.pdt_skip",
+                                ticker=ticker,
+                                reason="pattern_day_trader_protection",
+                            )
+                        else:
+                            logger.error(
+                                "engine.order_failed", ticker=ticker, error=exc_str
+                            )
 
         # 8. Circuit breaker check (after any order attempt)
         try:
@@ -1015,6 +1071,15 @@ class TradingEngine:
             logger.warning("engine.rebalance.skipped_no_weights")
             return
 
+        # Update VIX multiplier for the trading day
+        vix = self._fundamentals.get_vix()
+        self._vix_multiplier = _vix_risk_off_multiplier(vix)
+        logger.info(
+            "engine.vix_update",
+            vix=vix,
+            multiplier=self._vix_multiplier,
+        )
+
         self._execute_rebalance_orders()
 
     def _execute_rebalance_orders(self) -> None:
@@ -1099,8 +1164,20 @@ class TradingEngine:
                     n_skipped += 1
                     continue
 
-                n_shares = int(dollar_amount / price)
-                if n_shares <= 0:
+                # Cap at currently held quantity (fractional) to avoid over-selling
+                held = 0.0
+                if not positions.empty and "ticker" in positions.columns:
+                    pos_row = positions[positions["ticker"] == ticker]
+                    if not pos_row.empty:
+                        held = float(pos_row.iloc[0]["qty"])
+                if held <= 0.0:
+                    logger.debug("engine.rebalance.sell_no_position", ticker=ticker)
+                    n_skipped += 1
+                    continue
+
+                # Use fractional qty — cap at held to avoid over-selling
+                sell_qty = round(min(dollar_amount / price, held), 9) if price > 0 else 0.0
+                if sell_qty <= 0.0:
                     logger.debug(
                         "engine.rebalance.order_too_small",
                         ticker=ticker,
@@ -1109,21 +1186,9 @@ class TradingEngine:
                     n_skipped += 1
                     continue
 
-                # Cap at currently held quantity to avoid over-selling
-                held = 0
-                if not positions.empty and "ticker" in positions.columns:
-                    pos_row = positions[positions["ticker"] == ticker]
-                    if not pos_row.empty:
-                        held = int(float(pos_row.iloc[0]["qty"]))
-                if held <= 0:
-                    logger.debug("engine.rebalance.sell_no_position", ticker=ticker)
-                    n_skipped += 1
-                    continue
-                n_shares = min(n_shares, held)
-
                 order_req = MarketOrderRequest(
                     symbol=ticker,
-                    qty=n_shares,
+                    qty=sell_qty,
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY,
                 )
@@ -1133,7 +1198,7 @@ class TradingEngine:
                     "engine.rebalance.order_submitted",
                     ticker=ticker,
                     action="sell",
-                    qty=n_shares,
+                    qty=sell_qty,
                     dollar_amount=round(dollar_amount, 2),
                     target_weight=order["target_weight"],
                     order_id=str(submitted.id),
@@ -1207,8 +1272,8 @@ class TradingEngine:
                     n_skipped += 1
                     continue
 
-                n_shares = int(dollar_amount / price)
-                if n_shares <= 0:
+                # Use notional ordering so Alpaca handles fractional shares.
+                if dollar_amount < 1.0:
                     logger.debug(
                         "engine.rebalance.order_too_small",
                         ticker=ticker,
@@ -1219,18 +1284,18 @@ class TradingEngine:
 
                 order_req = MarketOrderRequest(
                     symbol=ticker,
-                    qty=n_shares,
+                    notional=round(dollar_amount, 2),
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                 )
                 submitted = self._executor._trading.submit_order(order_req)
-                available_cash -= n_shares * price   # track cash spend
+                available_cash -= dollar_amount   # track cash spend
                 n_executed += 1
                 logger.info(
                     "engine.rebalance.order_submitted",
                     ticker=ticker,
                     action="buy",
-                    qty=n_shares,
+                    notional=round(dollar_amount, 2),
                     dollar_amount=round(dollar_amount, 2),
                     target_weight=order["target_weight"],
                     order_id=str(submitted.id),

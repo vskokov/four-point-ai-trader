@@ -130,7 +130,7 @@ class LLMSentimentSignal:
         self,
         model: str = settings.OLLAMA_MODEL,
         host: str = settings.OLLAMA_HOST,
-        hours_back: int = 2,
+        hours_back: int = 4,
         min_relevance: float = 0.3,
     ) -> None:
         self.model = model
@@ -530,6 +530,36 @@ class LLMSentimentSignal:
                 n_new=n_new,
                 n_skipped_duplicate=n_skipped,
             )
+
+            # 2b. Local DB fallback — when no fresh live articles arrived,
+            # query the local news table for the most recent stored articles
+            # (up to 12 hours back, at most 2).  This gives the LLM some
+            # context for quiet tickers without widening the Alpaca window.
+            if n_new == 0 and storage is not None:
+                try:
+                    fallback_candidates = storage.query_news_fallback(
+                        ticker, hours_back=12, limit=2
+                    )
+                    n_fallback = 0
+                    for fa in fallback_candidates:
+                        fh = fa.get("headline_hash", "")
+                        if fh and (ticker, fh) in self._seen_hashes:
+                            continue
+                        fa["source"] = "local_cache"
+                        new_articles.append(fa)
+                        n_fallback += 1
+                    if n_fallback > 0:
+                        logger.info(
+                            "llm.pipeline.local_fallback",
+                            ticker=ticker,
+                            n_fallback=n_fallback,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "llm.pipeline.local_fallback_failed",
+                        ticker=ticker,
+                        error=str(exc)[:120],
+                    )
 
             # 3. Score
             score_result = self.score(ticker, new_articles)

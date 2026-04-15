@@ -7,7 +7,6 @@ OrderExecutor — Market order submission via Alpaca paper-trading.
 
 from __future__ import annotations
 
-import math
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -27,6 +26,12 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _MAX_RETRIES = 3
+
+_REGIME_KELLY_MULTIPLIER: dict[str, float] = {
+    "bear":    0.5,
+    "neutral": 1.0,
+    "bull":    1.2,
+}
 
 
 def _read_with_retry(fn: Any, label: str = "") -> Any:
@@ -172,6 +177,8 @@ class RiskManager:
         signal: int,
         account_info: dict[str, Any],
         current_positions: dict[str, dict[str, Any]],
+        regime: str = "neutral",
+        vix_multiplier: float = 1.0,
     ) -> dict[str, Any]:
         """
         Pre-trade check.
@@ -186,6 +193,12 @@ class RiskManager:
             Dict with at least ``equity`` key (from ``AlpacaMarketData.get_account_info``).
         current_positions:
             ``{ticker: {"market_value": float, ...}}``  — keyed by symbol.
+        regime:
+            Current market regime label (``"bear"``, ``"neutral"``, ``"bull"``).
+            Defaults to ``"neutral"`` (no adjustment).
+        vix_multiplier:
+            Pre-computed VIX risk-off multiplier in (0, 1].  Defaults to 1.0
+            (no reduction).  Stacks multiplicatively with the regime multiplier.
 
         Returns
         -------
@@ -213,6 +226,20 @@ class RiskManager:
 
             max_size_by_limit = (self.max_position_pct - current_pct) * equity
             max_size = min(max_size_by_limit, cash)  # never exceed available cash
+
+            # Apply regime and VIX multipliers
+            regime_mult = _REGIME_KELLY_MULTIPLIER.get(regime, 1.0)
+            effective_mult = regime_mult * vix_multiplier
+            max_size = max_size * effective_mult
+            logger.debug(
+                "risk.kelly_multipliers",
+                ticker=ticker,
+                regime=regime,
+                regime_mult=regime_mult,
+                vix_mult=vix_multiplier,
+                effective_mult=effective_mult,
+            )
+
             return {"approved": True, "reason": "ok", "max_size": max_size}
 
         # sell (-1) — circuit breaker already checked; no size limit on reducing
@@ -365,6 +392,8 @@ class OrderExecutor:
         confidence: float,
         account_info: dict[str, Any],
         signal_stats: dict[str, Any],
+        regime: str = "neutral",
+        vix_multiplier: float = 1.0,
     ) -> dict[str, Any]:
         """
         Size and submit a market order for *ticker*.
@@ -414,7 +443,10 @@ class OrderExecutor:
             for _, row in pos_df.iterrows()
         }
 
-        check = self._risk.check_trade(ticker, signal, account_info, current_positions)
+        check = self._risk.check_trade(
+            ticker, signal, account_info, current_positions,
+            regime=regime, vix_multiplier=vix_multiplier,
+        )
         if not check["approved"]:
             logger.warning(
                 "executor.order_rejected",
@@ -439,7 +471,6 @@ class OrderExecutor:
                 size_usd = cash * target_w * confidence
                 max_usd = cash * self._risk.max_position_pct
                 size_usd = min(size_usd, max_usd)
-                n_shares = int(size_usd / current_price) if current_price > 0 else 0
 
         if _use_kelly:
             kelly_f = self._risk.kelly_size(
@@ -448,62 +479,74 @@ class OrderExecutor:
                 avg_loss=float(signal_stats["avg_loss"]),
             )
             # Buys: sized off cash to enforce no-margin constraint.
-            # Sells: sized off equity (position value); capped at held shares below.
+            # Sells: sized off equity (position value); capped at held qty below.
             sizing_base = (
                 float(account_info["cash"]) if signal == 1
                 else float(account_info["equity"])
             )
             size_usd = sizing_base * kelly_f * confidence
-            n_shares = math.floor(size_usd / current_price) if current_price > 0 else 0
 
-        # Belt-and-suspenders: hard cash cap for buys regardless of sizing path.
-        # Sells free cash rather than consuming it — no cash constraint applies.
         if signal == 1:
+            # Buy: use notional ordering so Alpaca handles fractional shares.
+            # Belt-and-suspenders: cap at available cash regardless of sizing path.
             available_cash = float(account_info["cash"])
-            order_cost = n_shares * current_price
-            if order_cost > available_cash:
-                n_shares = int(available_cash / current_price) if current_price > 0 else 0
-                logger.info(
-                    "executor.order_capped_by_cash",
-                    ticker=ticker,
-                    original_cost=round(order_cost, 2),
-                    available_cash=round(available_cash, 2),
-                    capped_shares=n_shares,
-                )
+            size_usd = min(size_usd, available_cash)
+            if size_usd < 1.0:
+                logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)
+                return {"status": "too_small"}
 
-        if n_shares == 0:
-            logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)
-            return {"status": "too_small"}
+            side = OrderSide.BUY
+            order_req = MarketOrderRequest(
+                symbol=ticker,
+                notional=round(size_usd, 2),
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self._trading.submit_order(order_req)
+            result: dict[str, Any] = {
+                "status":          "submitted",
+                "ticker":          ticker,
+                "side":            side.value,
+                "notional":        round(size_usd, 2),
+                "estimated_price": current_price,
+                "timestamp":       datetime.now(timezone.utc).isoformat(),
+                "order_id":        str(order.id),
+            }
+            logger.info("executor.order_submitted", **result)
+            return result
 
-        if signal == -1:
-            # Cap sell quantity at current long position
+        else:  # signal == -1, sell
             pos_info = current_positions.get(ticker)
             if pos_info is None:
                 logger.warning("executor.sell_no_position", ticker=ticker)
                 return {"status": "no_position"}
-            held = int(pos_info["qty"])
-            n_shares = min(n_shares, held)
-            if n_shares == 0:
+            held = float(pos_info["qty"])
+            if held <= 0:
+                logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)
+                return {"status": "too_small"}
+            # Sell the Kelly-sized quantity, capped at the full held position.
+            sell_qty = min(size_usd / current_price, held) if current_price > 0 else 0.0
+            sell_qty = round(sell_qty, 9)
+            if sell_qty <= 0:
+                logger.info("executor.order_too_small", ticker=ticker, size_usd=size_usd)
                 return {"status": "too_small"}
 
-        side = OrderSide.BUY if signal == 1 else OrderSide.SELL
-        order_req = MarketOrderRequest(
-            symbol=ticker,
-            qty=n_shares,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-        )
-
-        order = self._trading.submit_order(order_req)
-
-        result: dict[str, Any] = {
-            "status":          "submitted",
-            "ticker":          ticker,
-            "side":            side.value,
-            "qty":             n_shares,
-            "estimated_price": current_price,
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
-            "order_id":        str(order.id),
-        }
-        logger.info("executor.order_submitted", **result)
-        return result
+            side = OrderSide.SELL
+            order_req = MarketOrderRequest(
+                symbol=ticker,
+                qty=sell_qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self._trading.submit_order(order_req)
+            result = {
+                "status":          "submitted",
+                "ticker":          ticker,
+                "side":            side.value,
+                "qty":             sell_qty,
+                "estimated_price": current_price,
+                "timestamp":       datetime.now(timezone.utc).isoformat(),
+                "order_id":        str(order.id),
+            }
+            logger.info("executor.order_submitted", **result)
+            return result

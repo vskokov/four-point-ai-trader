@@ -23,6 +23,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sqlalchemy
 import streamlit as st
+import yfinance as yf
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
@@ -258,6 +259,25 @@ def _compute_win_rates() -> pd.DataFrame:
         return pd.read_sql(sql, conn)
 
 
+@st.cache_data(ttl=60)
+def _load_spy_ohlcv(days_back: int) -> pd.DataFrame:
+    """Load SPY OHLCV from the DB and resample to a sensible granularity."""
+    sql = sqlalchemy.text("""
+        SELECT time, close
+        FROM   ohlcv
+        WHERE  ticker = 'SPY'
+          AND  time  >= NOW() - (:days * INTERVAL '1 day')
+        ORDER  BY time
+    """)
+    with _get_db_engine().connect() as conn:
+        df = pd.read_sql(sql, conn, params={"days": days_back})
+    if df.empty:
+        return df
+    df["time"] = _to_et(pd.to_datetime(df["time"], utc=True))
+    df = df.set_index("time").sort_index()
+    return df
+
+
 @st.cache_data(ttl=120)
 def _load_news(ticker: str | None, limit: int) -> pd.DataFrame:
     if ticker and ticker != "All":
@@ -279,6 +299,15 @@ def _load_news(ticker: str | None, limit: int) -> pd.DataFrame:
         params = {"limit": limit}
     with _get_db_engine().connect() as conn:
         return pd.read_sql(sql, conn, params=params)
+
+
+@st.cache_data(ttl=300)
+def _load_vix() -> float | None:
+    """Fetch the current VIX level from yfinance (5-minute cache)."""
+    try:
+        return float(yf.Ticker("^VIX").fast_info["last_price"])
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +485,7 @@ def _render_equity_chart(
     trades_df: pd.DataFrame,
     period_label: str,
     filled_orders_df: pd.DataFrame,
+    days_back: int = 1,
 ) -> None:
     if history_df.empty:
         st.info("Portfolio history unavailable — check Alpaca credentials.")
@@ -469,7 +499,7 @@ def _render_equity_chart(
         x=history_df["time"], y=history_df["equity"],
         mode="lines", name="Equity",
         line=dict(color="#38bdf8", width=2),
-        hovertemplate="%{x|%b %d %H:%M}<br>$%{y:,.2f}<extra></extra>",
+        hovertemplate="%{x|%b %d %H:%M ET}<br>$%{y:,.2f}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
         x=history_df["time"], y=history_df["equity"],
@@ -512,8 +542,29 @@ def _render_equity_chart(
                                 line=dict(width=1, color=border)),
                     text=subset["ticker"], textposition=pos,
                     textfont=dict(size=8, color=color),
-                    hovertemplate=f"%{{text}}<br>{label} @ %{{x|%H:%M}}<extra></extra>",
+                    hovertemplate=f"%{{text}}<br>{label} @ %{{x|%H:%M ET}}<extra></extra>",
                 ))
+
+    # --- SPY benchmark overlay ---
+    spy_df = _load_spy_ohlcv(days_back)
+    if not spy_df.empty and not history_df.empty:
+        resample_rules = {1: "5min", 7: "1h", 30: "1D"}
+        rule = resample_rules.get(days_back, "1h")
+        spy_resampled = spy_df["close"].resample(rule).last().dropna()
+        spy_resampled = spy_resampled.reset_index()
+        spy_resampled.columns = ["time", "spy_close"]
+        portfolio_start = float(history_df["equity"].iloc[0])
+        spy_start = float(spy_resampled["spy_close"].iloc[0])
+        if spy_start > 0:
+            spy_resampled["spy_scaled"] = spy_resampled["spy_close"] / spy_start * portfolio_start
+            fig.add_trace(go.Scatter(
+                x=spy_resampled["time"],
+                y=spy_resampled["spy_scaled"],
+                mode="lines",
+                name="SPY (scaled)",
+                line=dict(color="rgba(148,163,184,0.7)", width=1.5, dash="dot"),
+                hovertemplate="SPY %{x|%b %d %H:%M ET}<br>$%{y:,.2f} (scaled)<extra></extra>",
+            ))
 
     eq_vals = history_df["equity"].dropna()
     eq_min, eq_max = float(eq_vals.min()), float(eq_vals.max())
@@ -634,7 +685,7 @@ def _render_ticker_chart(
                 x=list(ou_times), y=list(ou["ou_zscore"].astype(float)),
                 mode="lines+markers", name="OU Z-score",
                 line=dict(color="#f59e0b", width=1.5), marker=dict(size=4),
-                hovertemplate="%{x|%H:%M}<br>z=%{y:.3f}<extra></extra>",
+                hovertemplate="%{x|%H:%M ET}<br>z=%{y:.3f}<extra></extra>",
             ), row=2, col=1)
             for lvl in (2.0, -2.0):
                 fig.add_hline(y=lvl, line_dash="dash",
@@ -650,7 +701,7 @@ def _render_ticker_chart(
                 x=list(sc_times), y=list(sc["score"].astype(float)),
                 mode="lines+markers", name="MWU Score",
                 line=dict(color="#a78bfa", width=1.5), marker=dict(size=4),
-                hovertemplate="%{x|%H:%M}<br>score=%{y:.4f}<extra></extra>",
+                hovertemplate="%{x|%H:%M ET}<br>score=%{y:.4f}<extra></extra>",
             ), row=3, col=1)
             for lvl in (0.2, -0.2):
                 fig.add_hline(y=lvl, line_dash="dash",
@@ -679,7 +730,7 @@ def _render_ticker_chart(
 # ---------------------------------------------------------------------------
 
 def _render_metrics(acct: dict | None, history_df: pd.DataFrame) -> None:
-    col_eq, col_day, col_week, col_cash = st.columns(4)
+    col_eq, col_day, col_week, col_cash, col_vix = st.columns(5)
     equity = acct["equity"] if acct else None
     cash   = acct["cash"]   if acct else None
     daily_delta = daily_pct = weekly_delta = weekly_pct = None
@@ -720,6 +771,13 @@ def _render_metrics(acct: dict | None, history_df: pd.DataFrame) -> None:
                   delta_color=_dc(weekly_delta))
     with col_cash:
         st.metric("💵 Cash", f"${cash:,.2f}" if cash else "—")
+    vix = _load_vix()
+    with col_vix:
+        vix_str = f"{vix:.1f}" if vix is not None else "—"
+        vix_color = "inverse" if (vix or 0) > 30 else ("off" if (vix or 0) > 20 else "normal")
+        st.metric("😨 VIX", vix_str,
+                  delta="Risk-Off" if (vix or 0) > 30 else None,
+                  delta_color=vix_color)
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +803,7 @@ def _render_trade(row: pd.Series, orders_df: pd.DataFrame) -> None:
     ts = row["time"]
     if hasattr(ts, "tz_localize") and ts.tzinfo is None:
         ts = ts.tz_localize(timezone.utc)
-    ts_str   = str(ts)[:19].replace("T", " ")
+    ts_str   = _ts_to_et(ts).strftime("%m/%d %H:%M ET")
     sig      = int(row["final_signal"])
     score    = f"{float(row['score']):.4f}" if row.get("score") is not None else "—"
     order    = _find_order(row, orders_df)
@@ -819,7 +877,11 @@ def _render_trade(row: pd.Series, orders_df: pd.DataFrame) -> None:
             for h in headlines:
                 title    = h.get("title", "—")
                 source   = h.get("source") or "unknown"
-                pub      = str(h.get("published_at", ""))[:16].replace("T", " ")
+                _pub_raw = h.get("published_at", "")
+                try:
+                    pub = _ts_to_et(pd.Timestamp(_pub_raw)).strftime("%m/%d %H:%M ET") if _pub_raw else "—"
+                except Exception:
+                    pub = str(_pub_raw)[:16].replace("T", " ")
                 av_label = h.get("av_sentiment_label", "")
                 av_score = h.get("av_sentiment_score")
                 av_str   = (f"AV: {av_label} ({float(av_score):.3f})"
@@ -993,7 +1055,8 @@ def main() -> None:
         st.header("Settings")
         limit        = st.selectbox("Trades to display", [25, 50, 100], index=0)
         period_label = st.selectbox("Chart period", list(_CHART_PERIOD_MAP.keys()), index=0)
-        st.caption(f"Auto-refreshes every 60 s.  \nLast: {pd.Timestamp.now().strftime('%H:%M:%S')}")
+        _now_et = pd.Timestamp.now(tz="UTC").tz_convert("America/New_York")
+        st.caption(f"Auto-refreshes every 60 s.  \nLast: {_now_et.strftime('%H:%M:%S ET')}")
 
     period_alpaca, timeframe_str = _CHART_PERIOD_MAP[period_label]
     days_back   = _PERIOD_TO_DAYS[period_label]
@@ -1028,7 +1091,7 @@ def main() -> None:
             chart_trades = _load_trades(500)
         except Exception:
             chart_trades = pd.DataFrame()
-        _render_equity_chart(history_df, chart_trades, period_label, filled_orders)
+        _render_equity_chart(history_df, chart_trades, period_label, filled_orders, days_back=days_back)
 
         st.subheader("Open Positions")
         pos_df = _load_open_positions()
@@ -1067,6 +1130,14 @@ def main() -> None:
             ohlcv_df  = _load_ohlcv(sel_ticker, sel_days)
             regime_df = _load_regime_history(sel_ticker, sel_days)
             score_df  = _load_trades_for_ticker(sel_ticker, 500)
+            # Align score_df to the same time window as ohlcv / regime data.
+            # Without this, all 500 historical rows are plotted regardless of
+            # the selected period, making the x-axis span weeks instead of 1 day.
+            if not score_df.empty:
+                cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=sel_days)
+                score_df = score_df[
+                    pd.to_datetime(score_df["time"], utc=True) >= cutoff
+                ].copy()
             _render_ticker_chart(sel_ticker, ohlcv_df, regime_df, score_df, filled_orders)
 
             st.subheader(f"Recent Decisions — {sel_ticker}")

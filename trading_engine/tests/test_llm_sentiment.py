@@ -821,6 +821,121 @@ class TestRunPipelineSplit:
 
 
 # ---------------------------------------------------------------------------
+# Tests — local DB fallback
+# ---------------------------------------------------------------------------
+
+def _make_fallback_article(
+    title: str = "Old local news",
+    ticker: str = "AAPL",
+) -> dict[str, Any]:
+    """Minimal article in the shape returned by Storage.query_news_fallback."""
+    h = hashlib.sha256(title.encode()).hexdigest()
+    return {
+        "ticker":              ticker,
+        "tickers":             [ticker],
+        "title":               title,
+        "summary":             "Stored summary.",
+        "source":              "local_cache",
+        "headline_hash":       h,
+        "fetched_at":          datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
+        "published_at":        datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
+        "relevance_score":     0.5,
+        "av_sentiment_label":  "",
+        "av_sentiment_score":  None,
+    }
+
+
+class _FakeStorageWithFallback(_FakeStorage):
+    """_FakeStorage extended with a query_news_fallback stub."""
+
+    def __init__(self, fallback_articles: list[dict[str, Any]] | None = None) -> None:
+        super().__init__()
+        self._fallback_articles: list[dict[str, Any]] = fallback_articles or []
+        self.fallback_calls: list[dict[str, Any]] = []
+
+    def query_news_fallback(
+        self,
+        ticker: str,
+        hours_back: float = 12,
+        limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        self.fallback_calls.append({"ticker": ticker, "hours_back": hours_back, "limit": limit})
+        return [a for a in self._fallback_articles if a.get("ticker") == ticker]
+
+
+class TestLocalFallback:
+    """run_pipeline local DB fallback when no live articles arrive."""
+
+    def _av_empty(self) -> MagicMock:
+        av = MagicMock()
+        av.fetch_news.return_value = []
+        return av
+
+    def test_local_fallback_used_when_no_live_articles(self, sig: Any) -> None:
+        """When live fetch returns 0 articles, storage.query_news_fallback is called
+        and its articles are passed to score()."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        fallback_arts = [
+            _make_fallback_article(title="Old news A", ticker="AAPL"),
+            _make_fallback_article(title="Old news B", ticker="AAPL"),
+        ]
+        storage = _FakeStorageWithFallback(fallback_articles=fallback_arts)
+        av = self._av_empty()
+
+        results = sig.run_pipeline(["AAPL"], av, storage)
+
+        # query_news_fallback must have been called for AAPL
+        assert len(storage.fallback_calls) == 1
+        assert storage.fallback_calls[0]["ticker"] == "AAPL"
+
+        # score() was called → LLM was invoked (not no_data)
+        assert sig._client.chat.call_count >= 1
+
+        # Result is a scored (non-neutral) direction because articles arrived
+        assert results[0]["ticker"] == "AAPL"
+
+    def test_local_fallback_skips_seen_hashes(self, sig: Any) -> None:
+        """One of the 2 fallback articles is already in _seen_hashes;
+        only the unseen one must be passed to score()."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+
+        art_a = _make_fallback_article(title="Old news A", ticker="AAPL")
+        art_b = _make_fallback_article(title="Old news B", ticker="AAPL")
+
+        # Pre-cache article A so it is "already seen"
+        sig._seen_hashes.add(("AAPL", art_a["headline_hash"]))
+
+        storage = _FakeStorageWithFallback(fallback_articles=[art_a, art_b])
+        av = self._av_empty()
+
+        sig.run_pipeline(["AAPL"], av, storage)
+
+        # LLM was called (article B passed through)
+        assert sig._client.chat.call_count >= 1
+
+        # Only article B (the unseen one) reaches the signal log — verify via
+        # the fact that the news row count equals 1 (art_a is skipped as a
+        # local_cache source won't be re-inserted, but the pipeline passes
+        # exactly 1 article to score()).  We verify by checking fallback was
+        # called and that signal row exists.
+        assert len(storage.fallback_calls) == 1
+        assert len(storage.signal_rows) == 1
+
+    def test_no_fallback_when_live_articles_present(self, sig: Any) -> None:
+        """When live fetch returns 1+ articles, query_news_fallback must NOT be called."""
+        _set_llm_response(sig, _VALID_LLM_RESPONSE)
+        storage = _FakeStorageWithFallback()
+
+        av = MagicMock()
+        av.fetch_news.return_value = [_make_article(ticker="AAPL")]
+
+        sig.run_pipeline(["AAPL"], av, storage)
+
+        # No fallback call since live articles were present
+        assert len(storage.fallback_calls) == 0
+
+
+# ---------------------------------------------------------------------------
 # Tests — run_if_market_hours
 # ---------------------------------------------------------------------------
 

@@ -188,6 +188,7 @@ def _build_engine(
     mock_fundamentals.get_market_caps.return_value = {t: 1e12 for t in tickers}
     mock_fundamentals.get_earnings_dates.return_value = {t: None for t in tickers}
     mock_fundamentals.get_analyst_recommendations.return_value = {t: 0 for t in tickers}
+    mock_fundamentals.get_vix.return_value = None
     mock_alpaca_news = MagicMock()
     mock_alpaca_news.fetch_news.return_value = []
 
@@ -222,6 +223,9 @@ def _build_engine(
     engine._stable_regime = {t: 1 for t in all_tickers}  # 1 = neutral default
     engine._last_active_signal = {t: 0 for t in all_tickers}
     engine._last_signal_change_time = {t: None for t in all_tickers}
+    engine._pdt_blocked_today: set[str] = set()
+    engine._pdt_blocked_date = None
+    engine._vix_multiplier = 1.0
 
     return engine, mock_storage, mock_alpaca, mwu_map
 
@@ -327,6 +331,48 @@ class TestBarHandler:
         engine._executor.submit_order.side_effect = RuntimeError("Alpaca down")
         # Should not raise
         engine.bar_handler(_make_bar("AAPL"))
+
+    def test_pdt_error_adds_ticker_to_blocked_set(self, tmp_path, capsys):
+        """Reactive PDT catch: error 40310100 adds ticker to cooldown and logs WARNING not ERROR."""
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=-1, score=-0.5)
+        )
+        engine._executor.submit_order.side_effect = Exception(
+            '{"code":40310100,"message":"trade denied due to pattern day trading protection"}'
+        )
+        engine.bar_handler(_make_bar("AAPL"))
+
+        assert "AAPL" in engine._pdt_blocked_today
+        out = capsys.readouterr().out
+        assert "engine.bar_handler.pdt_skip" in out
+        assert "engine.order_failed" not in out
+
+    def test_pdt_blocked_ticker_skips_sell(self, tmp_path):
+        """Pre-check: a ticker already in _pdt_blocked_today does not reach submit_order."""
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=-1, score=-0.5)
+        )
+        engine._pdt_blocked_today.add("AAPL")
+        engine._pdt_blocked_date = datetime.now(timezone.utc).date()
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        engine._executor.submit_order.assert_not_called()
+
+    def test_pdt_blocked_set_resets_at_midnight(self, tmp_path):
+        """At UTC midnight rollover the blocked set is cleared and the order proceeds."""
+        from datetime import date as _date
+        engine, _, _, _ = _build_engine(
+            tmp_path=tmp_path, mwu_decision=_mwu_decision(signal=-1, score=-0.5)
+        )
+        engine._pdt_blocked_today.add("AAPL")
+        engine._pdt_blocked_date = _date(2026, 4, 13)  # yesterday
+
+        engine.bar_handler(_make_bar("AAPL"))
+
+        # Set is cleared; submit_order is called normally
+        assert "AAPL" not in engine._pdt_blocked_today
+        engine._executor.submit_order.assert_called_once()
 
     def test_order_skipped_when_market_closed(self, tmp_path):
         """bar_handler must not call submit_order when is_market_open() is False."""
@@ -1180,6 +1226,29 @@ class TestMainArgParsing:
 # _load_discovered_pairs
 # ===========================================================================
 
+class TestVixMultiplier:
+
+    def test_vix_multiplier_thresholds(self):
+        from trading_engine.orchestrator.engine import _vix_risk_off_multiplier
+        assert _vix_risk_off_multiplier(None) == 1.0
+        assert _vix_risk_off_multiplier(20.0) == 1.0
+        assert _vix_risk_off_multiplier(26.0) == 0.75
+        assert _vix_risk_off_multiplier(32.0) == 0.50
+        assert _vix_risk_off_multiplier(42.0) == 0.25
+
+    def test_vix_boundary_values(self):
+        from trading_engine.orchestrator.engine import _vix_risk_off_multiplier
+        # Exact boundary: >25 triggers 0.75, ==25 does not
+        assert _vix_risk_off_multiplier(25.0) == 1.0
+        assert _vix_risk_off_multiplier(25.001) == 0.75
+        # Exact boundary: >30 triggers 0.50, ==30 does not
+        assert _vix_risk_off_multiplier(30.0) == 0.75
+        assert _vix_risk_off_multiplier(30.001) == 0.50
+        # Exact boundary: >40 triggers 0.25, ==40 does not
+        assert _vix_risk_off_multiplier(40.0) == 0.50
+        assert _vix_risk_off_multiplier(40.001) == 0.25
+
+
 class TestLoadDiscoveredPairs:
 
     def test_missing_file_returns_empty_list(self, tmp_path):
@@ -1392,7 +1461,8 @@ class TestPairTickerAutoMerge:
         )
 
         assert engine._pairs == []
-        assert engine._tickers == ["AAPL"]
+        assert "AAPL" in engine._tickers
+        assert "SPY" in engine._tickers
 
 
 # ===========================================================================

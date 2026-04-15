@@ -8,6 +8,30 @@ The goal is not just to patch symptoms, but to make the behavior safer and more
 observable under real trading conditions, partial outages, and multi-module
 interactions.
 
+## Review status after remediation
+
+Status from follow-up review of the current code:
+
+| Concern                                       | Status    | Notes                                                                                                                                                   |
+| --------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Duplicate live-bar persistence                | Addressed | `stream_bars()` no longer writes live bars; `bar_handler()` remains the writer; `ohlcv` now also has duplicate cleanup + unique index defense-in-depth. |
+| Cross-ticker news dedup corruption            | Addressed | Dedup cache is now keyed by `(ticker, headline_hash)` and DB uniqueness is now `(ticker, headline_hash)`.                                               |
+| MWU penalized on missing outcome data         | Addressed | `get_actual_direction()` now returns `None` for unavailable data and `scheduled_update()` skips weight updates in that case.                            |
+| Regime smoothing not affecting MWU regime row | Addressed | Smoothed regime index is now tracked and passed into MWU.                                                                                               |
+| Rolling backups unused for recovery           | Addressed | `StateManager.load()` now falls back through backup files.                                                                                              |
+
+Follow-up notes from the review:
+
+- No new high-severity regressions were identified in the remediation itself.
+- Relevant unit tests passed in this session for `test_alpaca_client.py`,
+  `test_engine.py`, `test_mwu_agent.py`, and `test_llm_sentiment.py`.
+- `test_storage.py` was skipped because `TEST_DB_URL` was not set, so the DB
+  migration path for the new indexes/constraints is still only partially
+  validated in this session.
+- One minor follow-up remains worth considering: `Storage.insert_ohlcv()` still
+  returns `len(rows)` even though `ON CONFLICT DO NOTHING` can now skip rows due
+  to the new unique index, so its returned count can overstate actual inserts.
+
 ---
 
 ## Recommended implementation prompt
@@ -16,6 +40,7 @@ Use the following prompt when implementing the fixes:
 
 > Perform a focused remediation of the adversarial review findings in this repository.
 > Fix the issues without changing unrelated behavior:
+>
 > 1. Prevent duplicate OHLCV inserts for live streamed bars.
 > 2. Correct shared-news handling so the same article can be persisted and scored per ticker without cross-ticker dedup corruption.
 > 3. Prevent MWU weights from being penalized when price outcome data is unavailable or insufficient.
@@ -23,6 +48,7 @@ Use the following prompt when implementing the fixes:
 > 5. Add backup-based recovery for engine state corruption so valid backups are automatically tried before falling back to defaults.
 >
 > Requirements:
+>
 > - Reuse existing patterns and helpers.
 > - Preserve current public behavior where it is not directly implicated.
 > - Add or update tests that prove each bug is fixed.
@@ -30,6 +56,7 @@ Use the following prompt when implementing the fixes:
 > - Keep changes surgical and production-safe.
 >
 > Validation:
+>
 > - Run the relevant existing unit tests before and after changes.
 > - Add targeted tests for the newly covered failure modes.
 > - Summarize any intentional behavior changes.
@@ -147,7 +174,7 @@ For this codebase, the least disruptive fix is likely:
 3. Update `insert_news()` so duplicate handling follows that composite key.
 4. Change in-process LLM dedup from:
    - `headline_hash`
-   to:
+     to:
    - `(ticker, headline_hash)`
 5. Ensure prompt-level dedup inside a single ticker still removes repeated
    copies of the same article for that ticker.

@@ -342,22 +342,22 @@ class TestSubmitOrder:
         mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
         executor = _make_executor(mock_trading, mock_alpaca)
 
-        # cash=80_000 (equity*0.8), kelly_f≈0.10, confidence=1.0 → size_usd≈8_000 → ~79-80 shares
+        # cash=80_000 (equity*0.8), kelly_f≈0.10, confidence=1.0 → size_usd≈8_000
         result = executor.submit_order("AAPL", 1, 1.0, _account(100_000), _signal_stats())
 
         assert result["status"] == "submitted"
         assert result["ticker"] == "AAPL"
         assert result["side"] == "buy"
-        # Buy sized off cash (80K), not equity (100K) → qty < 100
-        assert result["qty"] < 100
-        assert result["qty"] > 0
+        # Buy uses notional (fractional shares) — check dollar amount not share count
+        assert result["notional"] > 0
+        assert result["notional"] <= 80_000.0   # capped at cash
         assert result["estimated_price"] == 100.0
         assert "order_id" in result
         assert "timestamp" in result
 
         call_args = mock_trading.submit_order.call_args[0][0]
         assert call_args.symbol == "AAPL"
-        assert call_args.qty == result["qty"]
+        assert call_args.notional == result["notional"]
 
     def test_sell_order_submitted_correctly(self):
         mock_trading = MagicMock()
@@ -407,13 +407,13 @@ class TestSubmitOrder:
         mock_alpaca = self._make_mock_alpaca(mid_price=100.0)
         executor = _make_executor(mock_trading, mock_alpaca)
 
-        # confidence=0.5 should roughly halve the share count vs confidence=1.0
+        # confidence=0.5 should roughly halve the notional vs confidence=1.0
         r_full = executor.submit_order("AAPL", 1, 1.0, _account(100_000), _signal_stats())
         mock_trading.get_all_positions.return_value = []
         r_half = executor.submit_order("AAPL", 1, 0.5, _account(100_000), _signal_stats())
 
-        # Allow ±1 tolerance from floor() rounding with floating-point kelly
-        assert abs(r_full["qty"] - r_half["qty"] * 2) <= 1
+        # notional at half confidence should be ~half of full confidence
+        assert abs(r_full["notional"] - r_half["notional"] * 2) <= 1.0
 
     def test_returns_skipped_when_market_closed(self):
         """submit_order must short-circuit with status=skipped when market is closed."""
@@ -643,9 +643,8 @@ class TestCashOnlyTrading:
         result = executor.submit_order("AAPL", 1, 1.0, account, _signal_stats())
 
         assert result["status"] == "submitted"
-        # Verify sizing is cash-based: qty must be well below the equity-based value
-        assert result["qty"] <= 15    # cash-based (~10), not equity-based (~200)
-        assert result["qty"] * 100.0 <= 10_000.0   # order cost ≤ available cash
+        # Verify sizing is cash-based: notional must be well below equity-based value
+        assert result["notional"] <= 10_000.0   # capped at cash, not equity (200K * 10% = 20K)
 
     def test_hard_cash_cap_limits_buy_shares(self):
         """Hard cap ensures order cost never exceeds available cash even after sizing."""
@@ -664,8 +663,8 @@ class TestCashOnlyTrading:
         result = executor.submit_order("AAPL", 1, 1.0, account, _signal_stats())
 
         assert result["status"] == "submitted"
-        # Order cost must never exceed available cash (hard cap guarantees this)
-        assert result["qty"] * 100.0 <= 5_000.0
+        # Notional must never exceed available cash (hard cap guarantees this)
+        assert result["notional"] <= 5_000.0
 
     def test_sell_not_blocked_by_zero_cash(self):
         """Sell orders must succeed even when cash=0 (sells free cash, not consume it)."""
@@ -705,3 +704,51 @@ class TestCashOnlyTrading:
         assert result["approved"] is True
         # 10% of 200K = 20K, but cash is only 10K → max_size must be 10K
         assert result["max_size"] == pytest.approx(10_000.0)
+
+    # ------------------------------------------------------------------
+    # Regime / VIX multiplier tests
+    # ------------------------------------------------------------------
+
+    def test_regime_bear_halves_kelly(self):
+        """bear regime → max_size ~50 % of neutral baseline."""
+        rm = _make_risk_manager(max_position_pct=0.10)
+        account = {"equity": 100_000.0, "cash": 100_000.0}
+
+        neutral = rm.check_trade("AAPL", 1, account, {}, regime="neutral")
+        bear    = rm.check_trade("AAPL", 1, account, {}, regime="bear")
+
+        assert bear["approved"] is True
+        assert bear["max_size"] == pytest.approx(neutral["max_size"] * 0.5)
+
+    def test_regime_bull_increases_kelly(self):
+        """bull regime → max_size ~120 % of neutral baseline."""
+        rm = _make_risk_manager(max_position_pct=0.10)
+        account = {"equity": 100_000.0, "cash": 100_000.0}
+
+        neutral = rm.check_trade("AAPL", 1, account, {}, regime="neutral")
+        bull    = rm.check_trade("AAPL", 1, account, {}, regime="bull")
+
+        assert bull["approved"] is True
+        assert bull["max_size"] == pytest.approx(neutral["max_size"] * 1.2)
+
+    def test_vix_40_reduces_to_25_pct(self):
+        """vix_multiplier=0.25 → max_size 25 % of base."""
+        rm = _make_risk_manager(max_position_pct=0.10)
+        account = {"equity": 100_000.0, "cash": 100_000.0}
+
+        base    = rm.check_trade("AAPL", 1, account, {})
+        reduced = rm.check_trade("AAPL", 1, account, {}, vix_multiplier=0.25)
+
+        assert reduced["approved"] is True
+        assert reduced["max_size"] == pytest.approx(base["max_size"] * 0.25)
+
+    def test_combined_bear_vix40(self):
+        """bear (0.5) × vix_multiplier=0.25 → 12.5 % of neutral base."""
+        rm = _make_risk_manager(max_position_pct=0.10)
+        account = {"equity": 100_000.0, "cash": 100_000.0}
+
+        base     = rm.check_trade("AAPL", 1, account, {}, regime="neutral")
+        combined = rm.check_trade("AAPL", 1, account, {}, regime="bear", vix_multiplier=0.25)
+
+        assert combined["approved"] is True
+        assert combined["max_size"] == pytest.approx(base["max_size"] * 0.5 * 0.25)
