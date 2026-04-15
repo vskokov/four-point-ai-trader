@@ -893,6 +893,27 @@ class TradingEngine:
             self._last_active_signal[ticker] = final_signal
             self._last_signal_change_time[ticker] = _now
 
+        # Always persist score so the dashboard has a continuous signal trace.
+        try:
+            self._storage.insert_mwu_score({
+                "time":               datetime.now(tz=timezone.utc),
+                "ticker":             ticker,
+                "score":              float(decision["score"]),
+                "final_signal":       final_signal,
+                "regime_label":       regime_label,
+                "hmm_signal":         int(hmm_signal["signal"]),
+                "hmm_confidence":     float(hmm_signal["confidence"]),
+                "ou_signal":          int(ou_signal.get("signal", 0)),
+                "ou_confidence":      float(ou_signal.get("confidence", 0.0)),
+                "ou_zscore":          _to_float(ou_signal.get("z_score")),
+                "llm_signal":         int(llm_signal.get("signal", 0)),
+                "llm_confidence":     float(llm_signal.get("confidence", 0.0)),
+                "analyst_signal":     int(analyst_signal.get("signal", 0)),
+                "analyst_confidence": float(analyst_signal.get("confidence", 0.0)),
+            })
+        except Exception as exc:
+            logger.warning("engine.mwu_score_log_failed", ticker=ticker, error=str(exc))
+
         # 7. Order submission + trade log
         if final_signal != 0:
             # Always persist the decision so the dashboard shows it even when

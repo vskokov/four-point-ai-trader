@@ -147,6 +147,24 @@ def _load_trades(limit: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
+def _load_mwu_scores(ticker: str, days_back: int) -> pd.DataFrame:
+    """Load continuous per-bar MWU scores from mwu_score_log."""
+    sql = sqlalchemy.text("""
+        SELECT time, score, final_signal, regime_label,
+               hmm_signal, hmm_confidence,
+               ou_signal,  ou_confidence, ou_zscore,
+               llm_signal, llm_confidence,
+               analyst_signal, analyst_confidence
+        FROM   mwu_score_log
+        WHERE  ticker    = :ticker
+          AND  time     >= NOW() - (:days * INTERVAL '1 day')
+        ORDER  BY time
+    """)
+    with _get_db_engine().connect() as conn:
+        return pd.read_sql(sql, conn, params={"ticker": ticker, "days": days_back})
+
+
+@st.cache_data(ttl=30)
 def _load_trades_for_ticker(ticker: str, limit: int) -> pd.DataFrame:
     sql = sqlalchemy.text("""
         SELECT id, time, ticker, final_signal, score,
@@ -608,6 +626,7 @@ def _render_ticker_chart(
     regime_df: pd.DataFrame,
     score_df: pd.DataFrame,
     filled_orders: pd.DataFrame,
+    mwu_scores_df: pd.DataFrame | None = None,
 ) -> None:
     if ohlcv_df.empty:
         st.info(f"No OHLCV data found for {ticker} in the selected period.")
@@ -676,15 +695,19 @@ def _render_ticker_chart(
                     hovertext=hover, hoverinfo="text",
                 ), row=1, col=1)
 
-    # Row 2: OU z-score from trade_log.ou_zscore
-    if not score_df.empty and "ou_zscore" in score_df.columns:
-        ou = score_df.dropna(subset=["ou_zscore"]).copy()
+    # Row 2: OU z-score — prefer continuous mwu_score_log; fall back to sparse trade_log
+    _ou_src = mwu_scores_df if (mwu_scores_df is not None and not mwu_scores_df.empty) else score_df
+    if _ou_src is not None and not _ou_src.empty and "ou_zscore" in _ou_src.columns:
+        ou = _ou_src.dropna(subset=["ou_zscore"]).copy()
         if not ou.empty:
             ou_times = _to_et(pd.to_datetime(ou["time"], utc=True))
+            _ou_dense = mwu_scores_df is not None and not mwu_scores_df.empty
             fig.add_trace(go.Scatter(
                 x=list(ou_times), y=list(ou["ou_zscore"].astype(float)),
-                mode="lines+markers", name="OU Z-score",
-                line=dict(color="#f59e0b", width=1.5), marker=dict(size=4),
+                mode="lines" if _ou_dense else "lines+markers",
+                name="OU Z-score",
+                line=dict(color="#f59e0b", width=1.5),
+                **({"marker": dict(size=4)} if not _ou_dense else {}),
                 hovertemplate="%{x|%H:%M ET}<br>z=%{y:.3f}<extra></extra>",
             ), row=2, col=1)
             for lvl in (2.0, -2.0):
@@ -692,15 +715,19 @@ def _render_ticker_chart(
                               line_color="rgba(245,158,11,0.4)",
                               line_width=1, row=2, col=1)
 
-    # Row 3: MWU ensemble score from trade_log.score
-    if not score_df.empty and "score" in score_df.columns:
-        sc = score_df.dropna(subset=["score"]).copy()
+    # Row 3: MWU ensemble score — prefer continuous mwu_score_log; fall back to sparse trade_log
+    _sc_src = mwu_scores_df if (mwu_scores_df is not None and not mwu_scores_df.empty) else score_df
+    if _sc_src is not None and not _sc_src.empty and "score" in _sc_src.columns:
+        sc = _sc_src.dropna(subset=["score"]).copy()
         if not sc.empty:
             sc_times = _to_et(pd.to_datetime(sc["time"], utc=True))
+            _sc_dense = mwu_scores_df is not None and not mwu_scores_df.empty
             fig.add_trace(go.Scatter(
                 x=list(sc_times), y=list(sc["score"].astype(float)),
-                mode="lines+markers", name="MWU Score",
-                line=dict(color="#a78bfa", width=1.5), marker=dict(size=4),
+                mode="lines" if _sc_dense else "lines+markers",
+                name="MWU Score",
+                line=dict(color="#a78bfa", width=1.5),
+                **({"marker": dict(size=4)} if not _sc_dense else {}),
                 hovertemplate="%{x|%H:%M ET}<br>score=%{y:.4f}<extra></extra>",
             ), row=3, col=1)
             for lvl in (0.2, -0.2):
@@ -710,6 +737,28 @@ def _render_ticker_chart(
             fig.add_hline(y=0, line_dash="dot",
                           line_color="rgba(255,255,255,0.2)",
                           line_width=1, row=3, col=1)
+            # Overlay action markers where final_signal != 0
+            if "final_signal" in sc.columns:
+                actions = sc[sc["final_signal"] != 0].copy()
+                if not actions.empty:
+                    for sig_val, sym, color, label in [
+                        (1,  "triangle-up",   "#22c55e", "BUY decision"),
+                        (-1, "triangle-down", "#ef4444", "SELL decision"),
+                    ]:
+                        sub = actions[actions["final_signal"] == sig_val]
+                        if sub.empty:
+                            continue
+                        sub_times = _to_et(pd.to_datetime(sub["time"], utc=True))
+                        fig.add_trace(go.Scatter(
+                            x=list(sub_times), y=list(sub["score"].astype(float)),
+                            mode="markers", name=label,
+                            marker=dict(symbol=sym, size=10, color=color,
+                                        line=dict(width=1.5, color="white")),
+                            hovertemplate=(
+                                f"{label}<br>%{{x|%H:%M ET}}"
+                                f"<br>score=%{{y:.4f}}<extra></extra>"
+                            ),
+                        ), row=3, col=1)
 
     fig.update_layout(
         height=650, showlegend=True, hovermode="x unified",
@@ -1126,10 +1175,11 @@ def main() -> None:
                 sel_period = st.selectbox(
                     "Period", list(_CHART_PERIOD_MAP.keys()), index=0, key="ticker_period"
                 )
-            sel_days  = _PERIOD_TO_DAYS[sel_period]
-            ohlcv_df  = _load_ohlcv(sel_ticker, sel_days)
-            regime_df = _load_regime_history(sel_ticker, sel_days)
-            score_df  = _load_trades_for_ticker(sel_ticker, 500)
+            sel_days      = _PERIOD_TO_DAYS[sel_period]
+            ohlcv_df      = _load_ohlcv(sel_ticker, sel_days)
+            regime_df     = _load_regime_history(sel_ticker, sel_days)
+            score_df      = _load_trades_for_ticker(sel_ticker, 500)
+            mwu_scores_df = _load_mwu_scores(sel_ticker, sel_days)
             # Align score_df to the same time window as ohlcv / regime data.
             # Without this, all 500 historical rows are plotted regardless of
             # the selected period, making the x-axis span weeks instead of 1 day.
@@ -1138,7 +1188,9 @@ def main() -> None:
                 score_df = score_df[
                     pd.to_datetime(score_df["time"], utc=True) >= cutoff
                 ].copy()
-            _render_ticker_chart(sel_ticker, ohlcv_df, regime_df, score_df, filled_orders)
+            _render_ticker_chart(
+                sel_ticker, ohlcv_df, regime_df, score_df, filled_orders, mwu_scores_df
+            )
 
             st.subheader(f"Recent Decisions — {sel_ticker}")
             ticker_trades = _load_trades_for_ticker(sel_ticker, limit)

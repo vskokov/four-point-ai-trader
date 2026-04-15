@@ -153,6 +153,34 @@ ALTER TABLE trade_log
     ADD COLUMN IF NOT EXISTS analyst_confidence FLOAT;
 """
 
+_DDL_MWU_SCORE_LOG = """
+CREATE TABLE IF NOT EXISTS mwu_score_log (
+    time               TIMESTAMPTZ  NOT NULL,
+    ticker             TEXT         NOT NULL,
+    score              FLOAT        NOT NULL,
+    final_signal       INT          NOT NULL,
+    regime_label       TEXT,
+    hmm_signal         INT,
+    hmm_confidence     FLOAT,
+    ou_signal          INT,
+    ou_confidence      FLOAT,
+    ou_zscore          FLOAT,
+    llm_signal         INT,
+    llm_confidence     FLOAT,
+    analyst_signal     INT,
+    analyst_confidence FLOAT
+);
+"""
+
+_DDL_MWU_SCORE_LOG_HYPERTABLE = """
+SELECT create_hypertable('mwu_score_log', 'time', if_not_exists => TRUE);
+"""
+
+_DDL_MWU_SCORE_LOG_INDEX = """
+CREATE INDEX IF NOT EXISTS ix_mwu_score_log_ticker_time
+    ON mwu_score_log (ticker, time DESC);
+"""
+
 
 # ---------------------------------------------------------------------------
 # Engine factory
@@ -207,6 +235,9 @@ class Storage:
             conn.execute(text(_DDL_REGIME_LOG_HYPERTABLE))
             conn.execute(text(_DDL_TRADE_LOG))
             conn.execute(text(_DDL_TRADE_LOG_ADD_ANALYST))
+            conn.execute(text(_DDL_MWU_SCORE_LOG))
+            conn.execute(text(_DDL_MWU_SCORE_LOG_HYPERTABLE))
+            conn.execute(text(_DDL_MWU_SCORE_LOG_INDEX))
         # Dedup must be fully committed before CREATE UNIQUE INDEX scans the
         # table — TimescaleDB chunk scans inside the index build do not see
         # uncommitted deletes from the same transaction.
@@ -576,6 +607,57 @@ class Storage:
             "storage.insert_trade_log",
             ticker=r.get("ticker"),
             final_signal=r.get("final_signal"),
+        )
+
+    def insert_mwu_score(self, row: dict[str, Any]) -> None:
+        """
+        Insert one MWU score row (called every bar, unconditionally).
+
+        Parameters
+        ----------
+        row:
+            Dict with keys: time, ticker, score, final_signal, regime_label,
+            hmm_signal, hmm_confidence, ou_signal, ou_confidence, ou_zscore,
+            llm_signal, llm_confidence, analyst_signal, analyst_confidence.
+            All signal/confidence fields are optional (None stored as NULL).
+        """
+        sql = text("""
+            INSERT INTO mwu_score_log (
+                time, ticker, score, final_signal, regime_label,
+                hmm_signal, hmm_confidence,
+                ou_signal,  ou_confidence, ou_zscore,
+                llm_signal, llm_confidence,
+                analyst_signal, analyst_confidence
+            ) VALUES (
+                :time, :ticker, :score, :final_signal, :regime_label,
+                :hmm_signal, :hmm_confidence,
+                :ou_signal,  :ou_confidence, :ou_zscore,
+                :llm_signal, :llm_confidence,
+                :analyst_signal, :analyst_confidence
+            )
+        """)
+        with self._engine.begin() as conn:
+            conn.execute(sql, {
+                "time":               row["time"],
+                "ticker":             row["ticker"],
+                "score":              float(row["score"]),
+                "final_signal":       int(row["final_signal"]),
+                "regime_label":       row.get("regime_label"),
+                "hmm_signal":         row.get("hmm_signal"),
+                "hmm_confidence":     row.get("hmm_confidence"),
+                "ou_signal":          row.get("ou_signal"),
+                "ou_confidence":      row.get("ou_confidence"),
+                "ou_zscore":          row.get("ou_zscore"),
+                "llm_signal":         row.get("llm_signal"),
+                "llm_confidence":     row.get("llm_confidence"),
+                "analyst_signal":     row.get("analyst_signal"),
+                "analyst_confidence": row.get("analyst_confidence"),
+            })
+        logger.debug(
+            "storage.insert_mwu_score",
+            ticker=row["ticker"],
+            score=row["score"],
+            final_signal=row["final_signal"],
         )
 
     def query_trade_log(self, limit: int = 50) -> pd.DataFrame:

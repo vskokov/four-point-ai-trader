@@ -298,6 +298,31 @@ class TestBarHandler:
         order_call = engine._executor.submit_order.call_args[1]
         assert order_call["signal"] == -1
 
+    def test_bar_handler_writes_mwu_score_every_bar(self, tmp_path):
+        """insert_mwu_score must be called regardless of final_signal value."""
+        engine, mock_storage, _, mwu_map = _build_engine(tmp_path=tmp_path)
+        # neutral MWU decision — final_signal=0
+        mwu_map["AAPL"].scheduled_update.return_value = _mwu_decision(signal=0)
+        engine.bar_handler(_make_bar("AAPL"))
+        mock_storage.insert_mwu_score.assert_called_once()
+
+    def test_bar_handler_writes_mwu_score_on_buy_signal(self, tmp_path):
+        """insert_mwu_score is also called when final_signal=+1."""
+        engine, mock_storage, _, mwu_map = _build_engine(tmp_path=tmp_path)
+        mwu_map["AAPL"].scheduled_update.return_value = _mwu_decision(signal=1)
+        engine.bar_handler(_make_bar("AAPL"))
+        mock_storage.insert_mwu_score.assert_called_once()
+        call_kwargs = mock_storage.insert_mwu_score.call_args[0][0]
+        assert call_kwargs["final_signal"] == 1
+        assert "score" in call_kwargs
+        assert "ticker" in call_kwargs
+
+    def test_bar_handler_mwu_score_write_failure_does_not_crash(self, tmp_path):
+        """A DB error on insert_mwu_score must not propagate out of bar_handler."""
+        engine, mock_storage, _, _ = _build_engine(tmp_path=tmp_path)
+        mock_storage.insert_mwu_score.side_effect = RuntimeError("db down")
+        engine.bar_handler(_make_bar("AAPL"))  # must not raise
+
     def test_unknown_ticker_ignored(self, tmp_path):
         engine, mock_storage, _, _ = _build_engine(tmp_path=tmp_path)
         # "GOOG" not in tickers
