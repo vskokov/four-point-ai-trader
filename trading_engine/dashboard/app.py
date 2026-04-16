@@ -375,7 +375,7 @@ def _load_portfolio_history(period: str, timeframe_str: str) -> pd.DataFrame:
             GetPortfolioHistoryRequest(
                 period=period,
                 timeframe=timeframe_str,
-                extended_hours=False,
+                extended_hours=True,
             )
         )
         if not history or not history.timestamp:
