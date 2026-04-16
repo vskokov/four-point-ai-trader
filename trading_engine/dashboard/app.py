@@ -160,8 +160,11 @@ def _load_mwu_scores(ticker: str, days_back: int) -> pd.DataFrame:
           AND  time     >= NOW() - (:days * INTERVAL '1 day')
         ORDER  BY time
     """)
-    with _get_db_engine().connect() as conn:
-        return pd.read_sql(sql, conn, params={"ticker": ticker, "days": days_back})
+    try:
+        with _get_db_engine().connect() as conn:
+            return pd.read_sql(sql, conn, params={"ticker": ticker, "days": days_back})
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=30)
